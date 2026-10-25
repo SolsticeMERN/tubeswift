@@ -4,3 +4,5 @@ node_modules/
 *.csv
 .env
 yt-dlp
+yt-dlp_macos
+cookies.txt

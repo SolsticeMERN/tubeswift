@@ -18,10 +18,32 @@ app.get('/health', (req, res) => {
 });
 
 
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+
+// Initialize cookies from environment variables if set (for Render / cloud deployments)
+if (process.env.YOUTUBE_COOKIES_BASE64) {
+  try {
+    const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
+    fs.writeFileSync(COOKIES_PATH, decoded, 'utf-8');
+    console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES_BASE64 env.');
+  } catch (err) {
+    console.error('[ERR] Failed to decode YOUTUBE_COOKIES_BASE64:', err);
+  }
+} else if (process.env.YOUTUBE_COOKIES) {
+  try {
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf-8');
+    console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES env.');
+  } catch (err) {
+    console.error('[ERR] Failed to write YOUTUBE_COOKIES:', err);
+  }
+}
+
 // Locate yt-dlp executable
 function getYtDlpPath() {
   const possiblePaths = [
+    path.join(__dirname, 'yt-dlp_macos'),
     path.join(__dirname, 'yt-dlp'),
+    '/tmp/yt-dlp_macos',
     '/Users/shakilsarker/Library/Python/3.9/bin/yt-dlp',
     'yt-dlp',
     '/usr/local/bin/yt-dlp',
@@ -42,6 +64,22 @@ function getYtDlpPath() {
 
 const YTDLP_PATH = getYtDlpPath();
 console.log(`[INFO] Using yt-dlp at: ${YTDLP_PATH}`);
+
+// Helper to assemble standard yt-dlp arguments (Node JS challenge solver + cookies)
+function getBaseYtDlpArgs() {
+  const args = [
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
+    '--no-warnings',
+    '--no-playlist'
+  ];
+  if (fs.existsSync(COOKIES_PATH)) {
+    args.push('--cookies', COOKIES_PATH);
+  } else {
+    args.push('--extractor-args', 'youtube:player_client=ios,android_vr');
+  }
+  return args;
+}
 
 // Helper to format duration seconds to MM:SS or HH:MM:SS
 function formatDuration(seconds) {
@@ -97,10 +135,8 @@ app.get('/api/info', async (req, res) => {
 
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
-    '--extractor-args', 'youtube:player_client=ios,android_vr',
+    ...getBaseYtDlpArgs(),
     '--dump-single-json',
-    '--no-warnings',
-    '--no-playlist',
     cleanUrl
   ];
 
@@ -344,7 +380,11 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
 
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const fileExt = (ext || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const cleanTitle = sanitizeFilename(title || req.params.filename || 'TubeSwift_Video');
+  let rawTitle = title || req.params.filename || 'TubeSwift_Video';
+  if (rawTitle.toLowerCase().endsWith(`.${fileExt}`)) {
+    rawTitle = rawTitle.slice(0, -(fileExt.length + 1));
+  }
+  const cleanTitle = sanitizeFilename(rawTitle);
   const safeFilename = `${cleanTitle}.${fileExt}`;
 
   let contentType = 'video/mp4';
@@ -356,72 +396,57 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     contentType = category === 'audio_only' ? 'audio/webm' : 'video/webm';
   }
 
-  let dlArgs = [];
+  let dlArgs = [...getBaseYtDlpArgs()];
 
   if (fileExt === 'mp3') {
     // Transcode audio on the fly with ffmpeg
-    dlArgs = [
-      '--extractor-args', 'youtube:player_client=ios,android',
+    dlArgs.push(
       '--ffmpeg-location', FFMPEG_PATH,
-      '-f', 'bestaudio/140/18/best',
+      '-f', 'ba/b',
       '-x',
       '--audio-format', 'mp3',
       '--audio-quality', quality || '320k',
       '-o', '-',
-      '--no-warnings',
-      '--no-playlist',
       cleanUrl
-    ];
+    );
   } else if (fileExt === 'm4a') {
     // Extract AAC audio
-    dlArgs = [
-      '--extractor-args', 'youtube:player_client=ios,android',
+    dlArgs.push(
       '--ffmpeg-location', FFMPEG_PATH,
-      '-f', '140/bestaudio/18/best',
+      '-f', '140/ba/b',
       '-x',
       '--audio-format', 'm4a',
       '-o', '-',
-      '--no-warnings',
-      '--no-playlist',
       cleanUrl
-    ];
+    );
   } else if (category === 'ready') {
     if (format === '18') {
       // Instant progressive 360p with audio
-      dlArgs = [
-        '--extractor-args', 'youtube:player_client=ios,android',
-        '-f', '18/best',
+      dlArgs.push(
+        '-f', '18/b',
         '-o', '-',
-        '--no-warnings',
-        '--no-playlist',
         cleanUrl
-      ];
+      );
     } else {
       // 1080p / 720p merged with audio via ffmpeg
       const h = height || (format.includes('1080') ? 1080 : 720);
-      dlArgs = [
-        '--extractor-args', 'youtube:player_client=ios,android',
+      dlArgs.push(
         '--ffmpeg-location', FFMPEG_PATH,
         '-f', `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/18/best`,
         '--merge-output-format', 'mp4',
         '-o', '-',
-        '--no-warnings',
-        '--no-playlist',
         cleanUrl
-      ];
+      );
     }
   } else {
     // High-res video stream or audio stream
     const targetFmt = format || 'best';
-    dlArgs = [
-      '--extractor-args', 'youtube:player_client=ios,android',
+    dlArgs.push(
       '--ffmpeg-location', FFMPEG_PATH,
       '-f', `${targetFmt}/18/best`,
       '-o', '-',
-      '--no-warnings',
-      '--no-playlist',
       cleanUrl
-    ];
+    );
   }
 
   const child = spawn(YTDLP_PATH, dlArgs);
