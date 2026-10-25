@@ -12,6 +12,12 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Health check endpoint for uptime monitors and warmup pings
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
+});
+
+
 // Locate yt-dlp executable
 function getYtDlpPath() {
   const possiblePaths = [

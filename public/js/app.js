@@ -4,6 +4,16 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Option B: Dynamic API Base for Decoupled Frontend (Cloudflare Pages / Vercel) & Backend (Render)
+  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+  const isRenderDirect = window.location.hostname.includes('onrender.com');
+  const API_BASE = (isLocal || isRenderDirect) ? '' : 'https://tubeswift-kri3.onrender.com';
+
+  // Silent warm-up ping to wake up backend immediately on page load
+  if (API_BASE) {
+    fetch(`${API_BASE}/health`).catch(() => {});
+  }
+
   // Elements
   const urlInput = document.getElementById('urlInput');
   const btnPaste = document.getElementById('btnPaste');
@@ -216,7 +226,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 2800);
 
     try {
-      const response = await fetch(`/api/info?url=${encodeURIComponent(rawUrl)}`);
+      const response = await fetch(`${API_BASE}/api/info?url=${encodeURIComponent(rawUrl)}`);
       clearTimeout(t1);
       clearTimeout(t2);
 
@@ -506,7 +516,7 @@ document.addEventListener('DOMContentLoaded', () => {
       Saving...
     `;
 
-    let downloadUrl = `/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}&ext=${encodeURIComponent(ext)}&title=${encodeURIComponent(title)}`;
+    let downloadUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}&ext=${encodeURIComponent(ext)}&title=${encodeURIComponent(title)}`;
     if (category) downloadUrl += `&category=${encodeURIComponent(category)}`;
     if (quality) downloadUrl += `&quality=${encodeURIComponent(quality)}`;
     if (height) downloadUrl += `&height=${encodeURIComponent(height)}`;
