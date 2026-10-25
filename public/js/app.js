@@ -516,7 +516,15 @@ document.addEventListener('DOMContentLoaded', () => {
       Starting...
     `;
 
-    let downloadUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}&ext=${encodeURIComponent(ext)}&title=${encodeURIComponent(title)}`;
+    const cleanExt = (ext || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const cleanName = (title || 'TubeSwift_Video')
+      .replace(/[^\w\s-]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .substring(0, 50) || 'video';
+
+    // Explicit path ending with .mp4 / .mp3 so browsers always save with correct file extension
+    let downloadUrl = `${API_BASE}/api/download/${encodeURIComponent(cleanName)}.${cleanExt}?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}&ext=${encodeURIComponent(cleanExt)}&title=${encodeURIComponent(title)}`;
     if (category) downloadUrl += `&category=${encodeURIComponent(category)}`;
     if (quality) downloadUrl += `&quality=${encodeURIComponent(quality)}`;
     if (height) downloadUrl += `&height=${encodeURIComponent(height)}`;

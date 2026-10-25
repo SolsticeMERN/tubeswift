@@ -64,12 +64,13 @@ function formatBytes(bytes) {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
-// Clean filename for HTTP Content-Disposition
+// Clean filename for HTTP Content-Disposition (Pure safe characters for all OS)
 function sanitizeFilename(name) {
   return (name || 'video')
-    .replace(/[^\w\s\-\.\(\)\[\]]/gi, '')
+    .replace(/[^\w\s-]/gi, '')
     .trim()
-    .substring(0, 100);
+    .replace(/\s+/g, '_')
+    .substring(0, 60) || 'TubeSwift_Video';
 }
 
 // Extract YouTube Video ID
@@ -329,7 +330,7 @@ app.get('/api/info', async (req, res) => {
 });
 
 // API: Stream / Download Video or Audio (All Formats Handled)
-app.get('/api/download', (req, res) => {
+app.get(['/api/download', '/api/download/:filename'], (req, res) => {
   const { url, format, ext, title, quality, category, height } = req.query;
 
   if (!url) {
@@ -342,13 +343,16 @@ app.get('/api/download', (req, res) => {
   }
 
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const fileExt = ext || 'mp4';
-  const safeFilename = `${sanitizeFilename(title || 'TubeSwift_Download')}.${fileExt}`;
+  const fileExt = (ext || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const cleanTitle = sanitizeFilename(title || req.params.filename || 'TubeSwift_Video');
+  const safeFilename = `${cleanTitle}.${fileExt}`;
 
   console.log(`[INFO] Streaming download: ${safeFilename} (Format: ${format}, Ext: ${fileExt}, Cat: ${category})`);
 
-  // Set response headers for direct download
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeFilename)}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
+  // Standard RFC 6266 Content-Disposition:
+  // Clean ASCII filename="..." without percent encoding so Windows, Mac, and phones recognize the extension
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   
   if (fileExt === 'mp3') {
     res.setHeader('Content-Type', 'audio/mpeg');
