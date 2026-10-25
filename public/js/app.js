@@ -513,7 +513,7 @@ document.addEventListener('DOMContentLoaded', () => {
     btnElement.disabled = true;
     btnElement.innerHTML = `
       <svg class="spin-icon" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"></circle><path d="M12 2a10 10 0 0 1 10 10"></path></svg>
-      Saving...
+      Starting...
     `;
 
     let downloadUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}&ext=${encodeURIComponent(ext)}&title=${encodeURIComponent(title)}`;
@@ -521,20 +521,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (quality) downloadUrl += `&quality=${encodeURIComponent(quality)}`;
     if (height) downloadUrl += `&height=${encodeURIComponent(height)}`;
     
-    // Create an invisible link to trigger native browser save
-    const a = document.createElement('a');
-    a.href = downloadUrl;
-    a.setAttribute('download', `${title}.${ext}`);
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    showToast(`Download started: ${title.substring(0, 30)}...`);
 
-    showToast(`Download started for: ${title.substring(0, 30)}...`);
+    // Direct browser navigation: Since the server sends Content-Disposition: attachment,
+    // the page is never replaced, and the browser's native download manager starts immediately.
+    window.location.href = downloadUrl;
 
     setTimeout(() => {
       btnElement.disabled = false;
       btnElement.innerHTML = originalText;
-    }, 3500);
+    }, 4000);
   }
 
   // Save to Local History
