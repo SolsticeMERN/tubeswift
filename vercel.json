@@ -1,15 +1,11 @@
 {
-  "version": 2,
   "cleanUrls": true,
   "trailingSlash": false,
-  "routes": [
+  "outputDirectory": "public",
+  "rewrites": [
     {
-      "src": "/youtube-video-downloader",
-      "dest": "/index.html"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/public/$1"
+      "source": "/youtube-video-downloader",
+      "destination": "/index.html"
     }
   ]
 }
