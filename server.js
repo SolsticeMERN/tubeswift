@@ -97,7 +97,7 @@ app.get('/api/info', async (req, res) => {
 
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
-    '--extractor-args', 'youtube:player_client=android_vr',
+    '--extractor-args', 'youtube:player_client=ios,android_vr',
     '--dump-single-json',
     '--no-warnings',
     '--no-playlist',
@@ -347,21 +347,13 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
   const cleanTitle = sanitizeFilename(title || req.params.filename || 'TubeSwift_Video');
   const safeFilename = `${cleanTitle}.${fileExt}`;
 
-  console.log(`[INFO] Streaming download: ${safeFilename} (Format: ${format}, Ext: ${fileExt}, Cat: ${category})`);
-
-  // Standard RFC 6266 Content-Disposition:
-  // Clean ASCII filename="..." without percent encoding so Windows, Mac, and phones recognize the extension
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  
+  let contentType = 'video/mp4';
   if (fileExt === 'mp3') {
-    res.setHeader('Content-Type', 'audio/mpeg');
+    contentType = 'audio/mpeg';
   } else if (fileExt === 'm4a') {
-    res.setHeader('Content-Type', 'audio/mp4');
+    contentType = 'audio/mp4';
   } else if (fileExt === 'webm') {
-    res.setHeader('Content-Type', category === 'audio_only' ? 'audio/webm' : 'video/webm');
-  } else {
-    res.setHeader('Content-Type', 'video/mp4');
+    contentType = category === 'audio_only' ? 'audio/webm' : 'video/webm';
   }
 
   let dlArgs = [];
@@ -369,9 +361,9 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
   if (fileExt === 'mp3') {
     // Transcode audio on the fly with ffmpeg
     dlArgs = [
-      '--extractor-args', 'youtube:player_client=android',
+      '--extractor-args', 'youtube:player_client=ios,android',
       '--ffmpeg-location', FFMPEG_PATH,
-      '-f', 'bestaudio/18',
+      '-f', 'bestaudio/140/18/best',
       '-x',
       '--audio-format', 'mp3',
       '--audio-quality', quality || '320k',
@@ -383,9 +375,9 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
   } else if (fileExt === 'm4a') {
     // Extract AAC audio
     dlArgs = [
-      '--extractor-args', 'youtube:player_client=android',
+      '--extractor-args', 'youtube:player_client=ios,android',
       '--ffmpeg-location', FFMPEG_PATH,
-      '-f', '140/bestaudio/18',
+      '-f', '140/bestaudio/18/best',
       '-x',
       '--audio-format', 'm4a',
       '-o', '-',
@@ -397,8 +389,8 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     if (format === '18') {
       // Instant progressive 360p with audio
       dlArgs = [
-        '--extractor-args', 'youtube:player_client=android',
-        '-f', '18',
+        '--extractor-args', 'youtube:player_client=ios,android',
+        '-f', '18/best',
         '-o', '-',
         '--no-warnings',
         '--no-playlist',
@@ -408,9 +400,9 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
       // 1080p / 720p merged with audio via ffmpeg
       const h = height || (format.includes('1080') ? 1080 : 720);
       dlArgs = [
-        '--extractor-args', 'youtube:player_client=android',
+        '--extractor-args', 'youtube:player_client=ios,android',
         '--ffmpeg-location', FFMPEG_PATH,
-        '-f', `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/18`,
+        '-f', `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/18/best`,
         '--merge-output-format', 'mp4',
         '-o', '-',
         '--no-warnings',
@@ -422,9 +414,9 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     // High-res video stream or audio stream
     const targetFmt = format || 'best';
     dlArgs = [
-      '--extractor-args', 'youtube:player_client=android',
+      '--extractor-args', 'youtube:player_client=ios,android',
       '--ffmpeg-location', FFMPEG_PATH,
-      '-f', `${targetFmt}/18`,
+      '-f', `${targetFmt}/18/best`,
       '-o', '-',
       '--no-warnings',
       '--no-playlist',
@@ -434,10 +426,26 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
 
   const child = spawn(YTDLP_PATH, dlArgs);
 
-  child.stdout.pipe(res);
+  let headersSent = false;
+  let stderrOutput = '';
+
+  child.stdout.on('data', chunk => {
+    if (!headersSent) {
+      headersSent = true;
+      // Send 200 headers ONLY when real video/audio data is actively flowing
+      res.writeHead(200, {
+        'Content-Disposition': `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`,
+        'Content-Type': contentType,
+        'X-Content-Type-Options': 'nosniff',
+        'Access-Control-Allow-Origin': '*'
+      });
+    }
+    res.write(chunk);
+  });
 
   child.stderr.on('data', data => {
     const msg = data.toString();
+    stderrOutput += msg;
     if (!msg.includes('Deprecated Feature') && !msg.includes('NotOpenSSLWarning')) {
       console.error(`[YTDLP STDERR] ${msg.trim()}`);
     }
@@ -445,13 +453,20 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
 
   child.on('error', err => {
     console.error('[ERR] Process spawn error:', err);
-    if (!res.headersSent) {
+    if (!headersSent) {
       res.status(500).send('Download stream failed to initialize.');
     }
   });
 
   child.on('close', code => {
     console.log(`[INFO] Download stream completed with code ${code}`);
+    if (!headersSent) {
+      // yt-dlp errored before producing any data - do NOT send a 0-byte corrupt file
+      console.error(`[ERR] yt-dlp failed with code ${code} without data: ${stderrOutput}`);
+      res.status(500).send(`Unable to process video stream (YouTube Code ${code}). Please try another format.`);
+    } else {
+      res.end();
+    }
   });
 
   // If user cancels download or closes tab, kill child process cleanly
