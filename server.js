@@ -65,18 +65,17 @@ function getYtDlpPath() {
 const YTDLP_PATH = getYtDlpPath();
 console.log(`[INFO] Using yt-dlp at: ${YTDLP_PATH}`);
 
-// Helper to assemble standard yt-dlp arguments (Node JS challenge solver + cookies)
+// Helper to assemble standard yt-dlp arguments (Node JS challenge solver + cookies + web_embedded client)
 function getBaseYtDlpArgs() {
   const args = [
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
+    '--extractor-args', 'youtube:player_client=web_embedded,tv_samsung',
     '--no-warnings',
     '--no-playlist'
   ];
   if (fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
-  } else {
-    args.push('--extractor-args', 'youtube:player_client=ios,android_vr');
   }
   return args;
 }
