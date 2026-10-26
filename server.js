@@ -6,11 +6,13 @@ const fs = require('fs');
 const os = require('os');
 const { buildVideoInfo } = require('./lib/video-info');
 const { UpstreamGuard } = require('./lib/upstream-guard');
+const { VideoInfoCache } = require('./lib/video-cache');
 const FFMPEG_PATH = require('ffmpeg-static') || 'ffmpeg';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const upstreamGuard = new UpstreamGuard();
+const videoInfoCache = new VideoInfoCache({ ttlMs: 60 * 60 * 1000, maxItems: 300 });
 // Public downloads must not depend on the owner's rotating browser login.
 // Account access is an explicit deployment choice, never an automatic fallback.
 const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE === 'cookies';
@@ -172,7 +174,19 @@ function extractVideoId(url) {
 // rejected this instance. Queued requests can be cancelled and cannot grow
 // without limit. This is a capacity guard, not a durable background job queue.
 app.use(['/api/info', '/api/download'], async (req, res, next) => {
-  if (req.method !== 'GET' || !extractVideoId(req.query.url)) return next();
+  if (req.method !== 'GET') return next();
+  const videoId = extractVideoId(req.query.url);
+  if (!videoId) return next();
+
+  // Instant In-Memory Cache: return in 0ms without waiting on an upstream slot
+  if (req.path === '/api/info') {
+    const cached = videoInfoCache.get(videoId);
+    if (cached) {
+      console.log(`[INFO] Cache HIT for video ${videoId} (instant response)`);
+      return res.json({ success: true, data: cached, cached: true });
+    }
+  }
+
   const controller = new AbortController();
   const abort = () => controller.abort();
   res.once('close', abort);
@@ -197,10 +211,21 @@ app.get('/api/info', (req, res) => {
   if (!videoId) {
     return res.status(400).json({ success: false, error: 'Please provide a valid YouTube video or Shorts URL.' });
   }
+
+  // Double check cache
+  const cached = videoInfoCache.get(videoId);
+  if (cached) {
+    return res.json({ success: true, data: cached, cached: true });
+  }
+
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const proc = spawn(YTDLP_PATH, [
     ...getBaseYtDlpArgs(), '--ffmpeg-location', FFMPEG_PATH,
-    '--dump-single-json', '--skip-download', cleanUrl
+    '--dump-single-json', '--skip-download',
+    '--no-write-comments',
+    '--no-write-subs',
+    '--no-write-auto-subs',
+    cleanUrl
   ], { detached: process.platform !== 'win32' });
   let stdout = '';
   let stderr = '';
@@ -247,6 +272,7 @@ app.get('/api/info', (req, res) => {
       if (!data.totalOptionsCount) {
         return res.status(502).json({ success: false, error: 'YouTube did not provide any downloadable formats for this video.' });
       }
+      videoInfoCache.set(videoId, data);
       return res.json({ success: true, data });
     } catch (err) {
       console.error('[ERR] Could not process video information:', err.message);

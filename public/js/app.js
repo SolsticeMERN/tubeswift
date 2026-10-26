@@ -216,19 +216,17 @@ document.addEventListener('DOMContentLoaded', () => {
     btnFetch.disabled = true;
     statusText.textContent = 'Connecting to media server...';
 
-    // Micro-status updates
-    const t1 = setTimeout(() => {
-      statusText.textContent = 'Checking available video and audio formats...';
-    }, 1200);
-
-    const t2 = setTimeout(() => {
-      statusText.textContent = 'Finalizing download endpoints...';
-    }, 2800);
+    // Progressive micro-status updates during cold fetch
+    const statusTimers = [
+      setTimeout(() => { statusText.textContent = 'Solving media security challenge...'; }, 1000),
+      setTimeout(() => { statusText.textContent = 'Extracting 1080p, 720p & MP3 stream qualities...'; }, 2200),
+      setTimeout(() => { statusText.textContent = 'Finalizing download endpoints...'; }, 4200)
+    ];
+    const clearStatusTimers = () => statusTimers.forEach(clearTimeout);
 
     try {
       const response = await fetch(`${API_BASE}/api/info?url=${encodeURIComponent(rawUrl)}`);
-      clearTimeout(t1);
-      clearTimeout(t2);
+      clearStatusTimers();
 
       const resData = await response.json();
 
@@ -249,8 +247,7 @@ document.addEventListener('DOMContentLoaded', () => {
       showToast(`${currentVideoData.totalOptionsCount} download options loaded.`);
 
     } catch (err) {
-      clearTimeout(t1);
-      clearTimeout(t2);
+      clearStatusTimers();
       statusContainer.style.display = 'none';
       btnFetch.disabled = false;
       showError(err.message || 'Error communicating with downloader engine.');
