@@ -218,7 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Micro-status updates
     const t1 = setTimeout(() => {
-      statusText.textContent = 'Extracting 30+ stream resolutions (4K, 1080p, 720p, MP3)...';
+      statusText.textContent = 'Checking available video and audio formats...';
     }, 1200);
 
     const t2 = setTimeout(() => {
@@ -246,7 +246,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       // Smooth scroll to result
       resultCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      showToast('All 30 format qualities loaded!');
+      showToast(`${currentVideoData.totalOptionsCount} download options loaded.`);
 
     } catch (err) {
       clearTimeout(t1);
@@ -290,7 +290,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 data-ext="${fmt.ext || 'mp4'}" 
                 data-title="${encodeURIComponent(data.title)}"
                 data-category="${fmt.category || 'video'}"
-                data-quality="${fmt.quality || ''}"
+                data-quality="${fmt.bitrate || fmt.quality || ''}"
                 data-height="${fmt.height || ''}">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4m4-5l5 5 5-5m-5 5V3"></path></svg>
           ${btnText}

@@ -3,6 +3,8 @@ const cors = require('cors');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
+const { buildVideoInfo } = require('./lib/video-info');
 const FFMPEG_PATH = require('ffmpeg-static') || 'ffmpeg';
 
 const app = express();
@@ -18,22 +20,37 @@ app.get('/health', (req, res) => {
 });
 
 
-let COOKIES_PATH = fs.existsSync('/etc/secrets/cookies.txt')
-  ? '/etc/secrets/cookies.txt'
-  : path.join(__dirname, 'cookies.txt');
+const RENDER_COOKIES_PATH = '/etc/secrets/cookies.txt';
+const LOCAL_COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+let COOKIES_PATH = null;
+let runtimeCookiesDir = null;
+process.once('exit', () => {
+  if (runtimeCookiesDir) fs.rmSync(runtimeCookiesDir, { recursive: true, force: true });
+});
 
 function writeCookies(value) {
   const normalized = value.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
   if (!/^# (?:Netscape HTTP Cookie File|HTTP Cookie File)/.test(normalized)) {
     throw new Error('Cookies must be an exported Netscape cookie file.');
   }
-  const targetPath = path.join(__dirname, 'cookies.txt');
+  // yt-dlp writes its cookie jar on exit. Keep mounted secrets and the
+  // original export untouched by using a private, writable runtime copy.
+  runtimeCookiesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tubeswift-'));
+  const targetPath = path.join(runtimeCookiesDir, 'cookies.txt');
   fs.writeFileSync(targetPath, normalized, { encoding: 'utf-8', mode: 0o600 });
   try { fs.chmodSync(targetPath, 0o600); } catch (_) {}
   COOKIES_PATH = targetPath;
 }
 
 // Initialize cookies from environment variables if set (for Render / cloud deployments)
+const cookieSources = [
+  process.env.YOUTUBE_COOKIES_BASE64 && 'YOUTUBE_COOKIES_BASE64',
+  process.env.YOUTUBE_COOKIES && 'YOUTUBE_COOKIES',
+  fs.existsSync(RENDER_COOKIES_PATH) && RENDER_COOKIES_PATH
+].filter(Boolean);
+if (cookieSources.length > 1) {
+  console.warn(`[WARN] Multiple YouTube cookie sources configured. Using ${cookieSources[0]}; remove older sources before refreshing a lower-priority source.`);
+}
 if (process.env.YOUTUBE_COOKIES_BASE64) {
   try {
     const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
@@ -49,6 +66,20 @@ if (process.env.YOUTUBE_COOKIES_BASE64) {
   } catch (err) {
     console.error('[ERR] Failed to write YOUTUBE_COOKIES:', err);
   }
+} else {
+  const source = fs.existsSync(RENDER_COOKIES_PATH) ? RENDER_COOKIES_PATH : LOCAL_COOKIES_PATH;
+  if (fs.existsSync(source)) {
+    try {
+      writeCookies(fs.readFileSync(source, 'utf-8'));
+      console.log(`[INFO] Loaded YouTube cookies from ${source} into a writable runtime copy.`);
+    } catch (err) {
+      console.error('[ERR] Failed to load YouTube cookie file:', err.message);
+    }
+  }
+}
+if (!COOKIES_PATH) console.warn('[WARN] No valid YouTube cookie file loaded. Requests will use a guest session.');
+if (Number(process.versions.node.split('.')[0]) < 22) {
+  console.warn('[WARN] YouTube JavaScript challenge solving requires Node.js 22 or newer.');
 }
 
 // Locate yt-dlp executable
@@ -81,46 +112,31 @@ console.log(`[INFO] Using yt-dlp at: ${YTDLP_PATH}`);
 // Let yt-dlp select compatible YouTube clients for the current release.
 function getBaseYtDlpArgs() {
   const args = [
-    '--js-runtimes', 'node',
+    '--ignore-config',
+    '--socket-timeout', '20',
+    '--retries', '0',
+    '--extractor-retries', '0',
+    '--js-runtimes', `node:${process.execPath}`,
     '--remote-components', 'ejs:github',
-    '--extractor-args', 'youtube:player_client=web,mweb,web_embedded',
     '--no-playlist'
   ];
-  if (fs.existsSync(COOKIES_PATH)) {
+  if (COOKIES_PATH && fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
   }
   return args;
 }
 
 function describeYtDlpError(stderr) {
-  if (/sign in to confirm|not a bot|cookies are no longer valid/i.test(stderr)) {
-    return {
-      status: 503,
-      message: 'YouTube rejected the server session. The site administrator must refresh the YouTube cookies and check whether the hosting IP is blocked. Choosing another format will not fix this.'
-    };
+  if (/cookies are no longer valid|cookies.*(?:expired|invalid)/i.test(stderr)) {
+    return { status: 503, code: 'YOUTUBE_COOKIES_EXPIRED', message: 'The server YouTube login has expired. The site administrator needs to refresh the saved session.' };
   }
-  return { status: 502, message: 'YouTube could not provide this video. It may be unavailable or restricted. Please try again later.' };
-}
-
-// Helper to format duration seconds to MM:SS or HH:MM:SS
-function formatDuration(seconds) {
-  if (!seconds) return '0:00';
-  const hrs = Math.floor(seconds / 3600);
-  const mins = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-  if (hrs > 0) {
-    return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  if (/sign in to confirm|not a bot|HTTP Error 429/i.test(stderr)) {
+    return { status: 503, code: 'YOUTUBE_SESSION_REJECTED', message: 'YouTube is currently rejecting requests from this server. Please try again later.' };
   }
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-}
-
-// Helper to format byte sizes
-function formatBytes(bytes) {
-  if (!bytes || isNaN(bytes)) return null;
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  if (/private video|video unavailable|video is unavailable|has been removed|not available in your country/i.test(stderr)) {
+    return { status: 404, code: 'VIDEO_UNAVAILABLE', message: 'This video is unavailable, private, or restricted.' };
+  }
+  return { status: 502, code: 'YOUTUBE_REQUEST_FAILED', message: 'YouTube could not provide this video. Please try again later.' };
 }
 
 // Clean filename for HTTP Content-Disposition (Pure safe characters for all OS)
@@ -134,354 +150,263 @@ function sanitizeFilename(name) {
 
 // Extract YouTube Video ID
 function extractVideoId(url) {
-  if (!url) return null;
+  if (typeof url !== 'string') return null;
   const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
   return match ? match[1] : null;
 }
 
 // API: Get Video Information & Available Formats
-app.get('/api/info', async (req, res) => {
-  const videoUrl = req.query.url;
-  if (!videoUrl) {
-    return res.status(400).json({ success: false, error: 'Please provide a valid YouTube URL.' });
-  }
-
-  const videoId = extractVideoId(videoUrl);
+app.get('/api/info', (req, res) => {
+  const videoId = extractVideoId(typeof req.query.url === 'string' ? req.query.url : '');
   if (!videoId) {
-    return res.status(400).json({
-      success: false,
-      error: 'Invalid YouTube link. Please paste a standard video or Shorts URL (e.g. https://youtu.be/... or https://www.youtube.com/watch?v=...)'
-    });
+    return res.status(400).json({ success: false, error: 'Please provide a valid YouTube video or Shorts URL.' });
   }
-
   const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const args = [
-    ...getBaseYtDlpArgs(),
-    '--dump-single-json',
-    cleanUrl
-  ];
-
-  console.log(`[INFO] Fetching full format list for ID: ${videoId}`);
-
-  let stdoutData = '';
-  let stderrData = '';
-  const proc = spawn(YTDLP_PATH, args);
-
-  proc.stdout.on('data', chunk => {
-    stdoutData += chunk.toString();
-  });
-
-  proc.stderr.on('data', chunk => {
-    stderrData += chunk.toString();
-  });
-
-  proc.on('error', () => {
-    if (!res.headersSent) res.status(503).json({ success: false, error: 'Video service could not start. Please contact the site administrator.' });
-  });
-
-  proc.on('close', async (code) => {
-    if (res.headersSent || res.destroyed) return;
-    if (code !== 0 || !stdoutData.trim()) {
-      console.warn(`[WARN] yt-dlp exited with code ${code}. Error: ${stderrData}`);
-      const failure = describeYtDlpError(stderrData);
-      return res.status(failure.status).json({ success: false, error: failure.message });
-    }
-
+  const proc = spawn(YTDLP_PATH, [
+    ...getBaseYtDlpArgs(), '--ffmpeg-location', FFMPEG_PATH,
+    '--dump-single-json', '--skip-download', cleanUrl
+  ], { detached: process.platform !== 'win32' });
+  let stdout = '';
+  let stderr = '';
+  let stopped = false;
+  function stop() {
+    if (stopped) return;
+    stopped = true;
     try {
-      const info = JSON.parse(stdoutData);
-      const dur = info.duration || 215; // default fallback duration in seconds
-      const rawFormats = info.formats || [];
-
-      // Helper to find exact filesize from yt-dlp formats
-      const findFmtSize = (formatId, fallbackKbps) => {
-        const found = rawFormats.find(f => String(f.format_id) === String(formatId));
-        if (found) {
-          const bytes = found.filesize || found.filesize_approx;
-          if (bytes && !isNaN(bytes)) return formatBytes(bytes);
-        }
-        if (fallbackKbps) {
-          const bytes = (fallbackKbps * 1000 / 8) * dur;
-          return formatBytes(bytes);
-        }
-        return 'Available';
-      };
-
-      // Helper to estimate size from bitrate in kbps
-      const calcSize = (kbps) => {
-        const bytes = (kbps * 1000 / 8) * dur;
-        return `≈ ${formatBytes(bytes)}`;
-      };
-
-      // Size for progressive 360p (itag 18)
-      const fmt18 = rawFormats.find(f => String(f.format_id) === '18');
-      const size18 = (fmt18 && (fmt18.filesize || fmt18.filesize_approx)) 
-        ? formatBytes(fmt18.filesize || fmt18.filesize_approx) 
-        : formatBytes((450 * 1000 / 8) * dur);
-
-      // 1. Ready to Download (Video + Audio Combined)
-      const readyFormats = [
-        {
-          id: 'ready-1080p',
-          format_id: 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/18',
-          label: '★ 1080p Full HD MP4 — High Quality',
-          quality: '1080p Full HD',
-          resolution: '1920x1080',
-          ext: 'mp4',
-          height: 1080,
-          size: findFmtSize('299') !== 'Available' ? findFmtSize('299') : formatBytes((4800 * 1000 / 8) * dur),
-          category: 'ready',
-          isRecommended: true
-        },
-        {
-          id: 'ready-720p',
-          format_id: 'bestvideo[height<=720]+bestaudio/best[height<=720]/18',
-          label: '★ 720p HD MP4 — Fast & Clear',
-          quality: '720p HD',
-          resolution: '1280x720',
-          ext: 'mp4',
-          height: 720,
-          size: findFmtSize('298') !== 'Available' ? findFmtSize('298') : formatBytes((2800 * 1000 / 8) * dur),
-          category: 'ready',
-          isRecommended: false
-        },
-        {
-          id: 'ready-360p',
-          format_id: '18',
-          label: '★ 360p MP4 — Recommended (Instant)',
-          quality: '360p SD',
-          resolution: '640x360',
-          ext: 'mp4',
-          height: 360,
-          size: size18,
-          category: 'ready',
-          isRecommended: true
-        }
-      ];
-
-      // 2. High Quality Video Streams (Exact Itags & Resolutions matching SnapYT)
-      const highQualityFormats = [
-        { id: '2160p60-webm', format_id: '315', label: '2160p60 WEBM · 4K 60fps', quality: '2160p60 4K', resolution: '3840x2160', ext: 'webm', height: 2160, size: findFmtSize('315', 18000), category: 'video_high' },
-        { id: '2160p60-mp4', format_id: '401', label: '2160p60 MP4 (AV1) · 4K 60fps', quality: '2160p60 4K', resolution: '3840x2160', ext: 'mp4', height: 2160, size: findFmtSize('401', 9500), category: 'video_high' },
-        { id: '1440p60-webm', format_id: '308', label: '1440p60 WEBM · 2K 60fps', quality: '1440p60 2K', resolution: '2560x1440', ext: 'webm', height: 1440, size: findFmtSize('308', 6500), category: 'video_high' },
-        { id: '1440p60-mp4', format_id: '400', label: '1440p60 MP4 (AV1) · 2K 60fps', quality: '1440p60 2K', resolution: '2560x1440', ext: 'mp4', height: 1440, size: findFmtSize('400', 4200), category: 'video_high' },
-        { id: '1080p60-mp4', format_id: '299', label: '1080p60 MP4 · Full HD 60fps', quality: '1080p60 FHD', resolution: '1920x1080', ext: 'mp4', height: 1080, size: findFmtSize('299', 3800), category: 'video_high' },
-        { id: '1080p60-webm', format_id: '303', label: '1080p60 WEBM · Full HD 60fps', quality: '1080p60 FHD', resolution: '1920x1080', ext: 'webm', height: 1080, size: findFmtSize('303', 2900), category: 'video_high' },
-        { id: '1080p-mp4', format_id: '137', label: '1080p MP4 · Full HD', quality: '1080p FHD', resolution: '1920x1080', ext: 'mp4', height: 1080, size: findFmtSize('137', 2500), category: 'video_high' },
-        { id: '720p60-mp4', format_id: '298', label: '720p60 MP4 · HD 60fps', quality: '720p60 HD', resolution: '1280x720', ext: 'mp4', height: 720, size: findFmtSize('298', 2200), category: 'video_high' },
-        { id: '720p60-webm', format_id: '302', label: '720p60 WEBM · HD 60fps', quality: '720p60 HD', resolution: '1280x720', ext: 'webm', height: 720, size: findFmtSize('302', 1400), category: 'video_high' },
-        { id: '720p-mp4', format_id: '136', label: '720p MP4 · HD', quality: '720p HD', resolution: '1280x720', ext: 'mp4', height: 720, size: findFmtSize('136', 1300), category: 'video_high' },
-        { id: '720p-webm', format_id: '247', label: '720p WEBM · HD', quality: '720p HD', resolution: '1280x720', ext: 'webm', height: 720, size: findFmtSize('247', 900), category: 'video_high' },
-        { id: '480p-mp4', format_id: '135', label: '480p MP4 · Standard', quality: '480p SD', resolution: '854x480', ext: 'mp4', height: 480, size: findFmtSize('135', 550), category: 'video_high' },
-        { id: '480p-webm', format_id: '244', label: '480p WEBM', quality: '480p SD', resolution: '854x480', ext: 'webm', height: 480, size: findFmtSize('244', 480), category: 'video_high' },
-        { id: '360p-webm', format_id: '243', label: '360p WEBM', quality: '360p SD', resolution: '640x360', ext: 'webm', height: 360, size: findFmtSize('243', 310), category: 'video_high' },
-        { id: '360p-mp4', format_id: '134', label: '360p MP4', quality: '360p SD', resolution: '640x360', ext: 'mp4', height: 360, size: findFmtSize('134', 300), category: 'video_high' },
-        { id: '240p-mp4', format_id: '133', label: '240p MP4', quality: '240p Low', resolution: '426x240', ext: 'mp4', height: 240, size: findFmtSize('133', 160), category: 'video_high' },
-        { id: '240p-webm', format_id: '242', label: '240p WEBM', quality: '240p Low', resolution: '426x240', ext: 'webm', height: 240, size: findFmtSize('242', 150), category: 'video_high' },
-        { id: '144p-webm', format_id: '278', label: '144p WEBM', quality: '144p Mobile', resolution: '256x144', ext: 'webm', height: 144, size: findFmtSize('278', 80), category: 'video_high' },
-        { id: '144p-mp4', format_id: '160', label: '144p MP4', quality: '144p Mobile', resolution: '256x144', ext: 'mp4', height: 144, size: findFmtSize('160', 75), category: 'video_high' }
-      ];
-
-      // 3. MP3 Formats (Studio Transcoded)
-      const mp3Formats = [
-        { id: 'mp3-320', format_id: '18', label: 'MP3 · 320 kbps (Studio Quality)', quality: '320 kbps', bitrate: '320k', ext: 'mp3', size: calcSize(320), category: 'mp3' },
-        { id: 'mp3-256', format_id: '18', label: 'MP3 · 256 kbps (Premium Quality)', quality: '256 kbps', bitrate: '256k', ext: 'mp3', size: calcSize(256), category: 'mp3' },
-        { id: 'mp3-192', format_id: '18', label: 'MP3 · 192 kbps (Standard Quality)', quality: '192 kbps', bitrate: '192k', ext: 'mp3', size: calcSize(192), category: 'mp3' },
-        { id: 'mp3-128', format_id: '18', label: 'MP3 · 128 kbps (Compact / Mobile)', quality: '128 kbps', bitrate: '128k', ext: 'mp3', size: calcSize(128), category: 'mp3' }
-      ];
-
-      // 4. Native Audio Only
-      const nativeAudioFormats = [
-        { id: 'audio-opus-156', format_id: '251', label: 'Opus Audio · 156 kbps (High Fidelity)', quality: 'Opus 156k', bitrate: '156k', ext: 'webm', size: findFmtSize('251', 156), category: 'audio_only' },
-        { id: 'audio-m4a', format_id: '140', label: 'M4A Audio · 131 kbps (Original Apple AAC)', quality: 'M4A AAC', bitrate: '131k', ext: 'm4a', size: findFmtSize('140', 131), category: 'audio_only' },
-        { id: 'audio-opus-82', format_id: '250', label: 'Opus Audio · 82 kbps (Standard)', quality: 'Opus 82k', bitrate: '82k', ext: 'webm', size: findFmtSize('250', 82), category: 'audio_only' },
-        { id: 'audio-opus-64', format_id: '249', label: 'Opus Audio · 64 kbps (Low Data)', quality: 'Opus 64k', bitrate: '64k', ext: 'webm', size: findFmtSize('249', 64), category: 'audio_only' }
-      ];
-
-      // Flat combined array
-      const allOptions = [
-        ...readyFormats,
-        ...highQualityFormats,
-        ...mp3Formats,
-        ...nativeAudioFormats
-      ];
-
-      // Combined arrays for backwards compatibility
-      const videoFormats = [...readyFormats, ...highQualityFormats];
-      const audioFormats = [...mp3Formats, ...nativeAudioFormats];
-
-      // Pick best thumbnail
-      let bestThumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-      if (info.thumbnails && info.thumbnails.length > 0) {
-        bestThumbnail = info.thumbnails[info.thumbnails.length - 1].url || bestThumbnail;
+      if (process.platform !== 'win32' && proc.pid) process.kill(-proc.pid, 'SIGKILL');
+      else proc.kill('SIGKILL');
+    } catch (_) {}
+  }
+  const timer = setTimeout(() => {
+    stop();
+    if (!res.headersSent && !res.destroyed) res.status(504).json({ success: false, error: 'YouTube took too long to respond. Please try again later.' });
+  }, 60000);
+  res.on('close', () => {
+    clearTimeout(timer);
+    if (!res.writableEnded) stop();
+  });
+  proc.stdout.on('data', data => {
+    stdout += data.toString();
+    if (stdout.length > 8 * 1024 * 1024) {
+      stop();
+      if (!res.headersSent && !res.destroyed) res.status(502).json({ success: false, error: 'The video information was too large to process.' });
+    }
+  });
+  proc.stderr.on('data', data => { stderr = (stderr + data.toString()).slice(-32768); });
+  proc.on('error', () => {
+    clearTimeout(timer);
+    if (!res.headersSent && !res.destroyed) res.status(503).json({ success: false, error: 'The video service could not start. Please contact the site administrator.' });
+  });
+  proc.on('close', code => {
+    clearTimeout(timer);
+    if (res.headersSent || res.destroyed) return;
+    if (code !== 0 || !stdout.trim()) {
+      console.warn(`[WARN] YouTube extraction failed for ${videoId}: ${stderr}`);
+      const failure = describeYtDlpError(stderr);
+      return res.status(failure.status).json({ success: false, code: failure.code, error: failure.message });
+    }
+    try {
+      const data = buildVideoInfo(JSON.parse(stdout), videoId);
+      if (!data.totalOptionsCount) {
+        return res.status(502).json({ success: false, error: 'YouTube did not provide any downloadable formats for this video.' });
       }
-
-      return res.json({
-        success: true,
-        data: {
-          id: videoId,
-          title: info.title || 'YouTube Video',
-          author: info.uploader || info.channel || 'YouTube Creator',
-          authorUrl: info.uploader_url || `https://www.youtube.com/watch?v=${videoId}`,
-          thumbnail: bestThumbnail,
-          duration: dur,
-          durationFormatted: info.duration_string || formatDuration(dur),
-          views: info.view_count ? info.view_count.toLocaleString() : null,
-          allOptions: allOptions,
-          readyFormats: readyFormats,
-          highQualityFormats: highQualityFormats,
-          mp3Formats: mp3Formats,
-          nativeAudioFormats: nativeAudioFormats,
-          videoFormats: videoFormats,
-          audioFormats: audioFormats,
-          totalOptionsCount: allOptions.length
-        }
-      });
-
-    } catch (parseErr) {
-      console.error('[ERR] JSON parsing failed:', parseErr);
-      return res.status(500).json({ success: false, error: 'Failed to process video information.' });
+      return res.json({ success: true, data });
+    } catch (err) {
+      console.error('[ERR] Could not process video information:', err.message);
+      return res.status(502).json({ success: false, error: 'Could not process the video information.' });
     }
   });
 });
 
 // API: Stream / Download Video or Audio (All Formats Handled)
+// Complete merging/conversion before serving a file. yt-dlp skips its audio
+// postprocessors for stdout output, so `-x -o -` cannot produce a real MP3.
 app.get(['/api/download', '/api/download/:filename'], (req, res) => {
-  const { url, format, ext, title, quality, category, height } = req.query;
-
-  if (!url) {
-    return res.status(400).send('URL is required');
+  const fields = ['url', 'format', 'ext', 'title', 'quality', 'category', 'height'];
+  if (fields.some(key => req.query[key] !== undefined && typeof req.query[key] !== 'string')) {
+    return res.status(400).json({ success: false, error: 'Invalid download parameters.' });
   }
-
+  const { url, format = '', ext = 'mp4', title, quality = '', category = '', height = '' } = req.query;
   const videoId = extractVideoId(url);
-  if (!videoId) {
-    return res.status(400).send('Invalid YouTube URL');
+  if (!videoId) return res.status(400).json({ success: false, error: 'Invalid YouTube URL.' });
+
+  const fileExt = ext.toLowerCase();
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+  const exactFormats = format.split('+');
+  const isExact = format.length <= 160 && exactFormats.length <= 2 && exactFormats.every(id => safeId.test(id));
+  const legacyReady = /^bestvideo\[height<=(720|1080)\]\+bestaudio\/best\[height<=\1\]\/18$/.test(format);
+  if (!['mp4', 'webm', 'm4a', 'mp3'].includes(fileExt) ||
+      !['', 'ready', 'video_high', 'video', 'audio_only', 'mp3'].includes(category) ||
+      (height && (!/^\d{1,4}$/.test(height) || Number(height) < 1 || Number(height) > 4320)) ||
+      (format && !isExact && !(category === 'ready' && legacyReady)) ||
+      (category === 'ready' && fileExt !== 'mp4') ||
+      (category === 'mp3' && fileExt !== 'mp3') ||
+      (category === 'audio_only' && !['webm', 'm4a'].includes(fileExt)) ||
+      (['video_high', 'video'].includes(category) && !['mp4', 'webm'].includes(fileExt))) {
+    return res.status(400).json({ success: false, error: 'Unsupported download format.' });
   }
 
-  const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const fileExt = (ext || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '');
-  let rawTitle = title || req.params.filename || 'TubeSwift_Video';
-  if (rawTitle.toLowerCase().endsWith(`.${fileExt}`)) {
-    rawTitle = rawTitle.slice(0, -(fileExt.length + 1));
-  }
-  const cleanTitle = sanitizeFilename(rawTitle);
-  const safeFilename = `${cleanTitle}.${fileExt}`;
-
-  let contentType = 'video/mp4';
+  const dlArgs = [...getBaseYtDlpArgs(), '--ffmpeg-location', FFMPEG_PATH, '--no-progress', '--no-simulate'];
   if (fileExt === 'mp3') {
-    contentType = 'audio/mpeg';
+    // Accept both the dropdown's "320k" and older buttons' "320 kbps".
+    const bitrate = quality ? quality.trim().match(/^(128|192|256|320)\s*(?:k|kbps)?$/i) : ['', '320'];
+    if (!bitrate) return res.status(400).json({ success: false, error: 'Unsupported MP3 bitrate.' });
+    dlArgs.push('-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', `${bitrate[1]}k`);
   } else if (fileExt === 'm4a') {
-    contentType = 'audio/mp4';
-  } else if (fileExt === 'webm') {
-    contentType = category === 'audio_only' ? 'audio/webm' : 'video/webm';
-  }
-
-  let dlArgs = [...getBaseYtDlpArgs()];
-
-  if (fileExt === 'mp3') {
-    // Transcode audio on the fly with ffmpeg
-    dlArgs.push(
-      '--ffmpeg-location', FFMPEG_PATH,
-      '-f', 'ba/b',
-      '-x',
-      '--audio-format', 'mp3',
-      '--audio-quality', quality || '320k',
-      '-o', '-',
-      cleanUrl
-    );
-  } else if (fileExt === 'm4a') {
-    // Extract AAC audio
-    dlArgs.push(
-      '--ffmpeg-location', FFMPEG_PATH,
-      '-f', '140/ba/b',
-      '-x',
-      '--audio-format', 'm4a',
-      '-o', '-',
-      cleanUrl
-    );
-  } else if (category === 'ready') {
-    if (format === '18') {
-      // Instant progressive 360p with audio
-      dlArgs.push(
-        '-f', '18/b',
-        '-o', '-',
-        cleanUrl
-      );
+    if (exactFormats.length > 1) return res.status(400).json({ success: false, error: 'Choose one audio format.' });
+    dlArgs.push('-f', format ? `${format}[acodec!=none][vcodec=none]` : 'bestaudio', '-x', '--audio-format', 'm4a');
+  } else if (category === 'ready' || (!category && (!format || format === 'best'))) {
+    const limit = Number(height || (format.includes('720') ? 720 : 1080));
+    let selector;
+    if (isExact && format !== 'best') {
+      selector = exactFormats.length === 2
+        ? `${exactFormats[0]}[ext=mp4][vcodec!=none][height<=${limit}]+${exactFormats[1]}[ext=m4a][acodec!=none][vcodec=none]`
+        : `${format}[ext=mp4][vcodec!=none][acodec!=none][height<=${limit}]`;
     } else {
-      // 1080p / 720p merged with audio via ffmpeg
-      const h = height || (String(format || '').includes('1080') ? 1080 : 720);
-      dlArgs.push(
-        '--ffmpeg-location', FFMPEG_PATH,
-        '-f', `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/18/best`,
-        '--merge-output-format', 'mp4',
-        '-o', '-',
-        cleanUrl
-      );
+      selector = `bestvideo[ext=mp4][height<=${limit}]+bestaudio[ext=m4a]/best[ext=mp4][height<=${limit}]`;
     }
+    dlArgs.push('-f', selector, '--merge-output-format', 'mp4', '--remux-video', 'mp4');
   } else {
-    // High-res video stream or audio stream
-    const targetFmt = format || 'best';
-    dlArgs.push(
-      '--ffmpeg-location', FFMPEG_PATH,
-      '-f', `${targetFmt}/18/best`,
-      '-o', '-',
-      cleanUrl
-    );
+    if (!format || exactFormats.length !== 1) {
+      return res.status(400).json({ success: false, error: 'Choose an available format first.' });
+    }
+    const mediaFilter = category === 'audio_only' ? '[acodec!=none][vcodec=none]' : '[vcodec!=none]';
+    dlArgs.push('-f', `${format}[ext=${fileExt}]${mediaFilter}`);
   }
 
-  const child = spawn(YTDLP_PATH, dlArgs);
+  let rawTitle = title || req.params.filename || 'TubeSwift_Video';
+  if (rawTitle.toLowerCase().endsWith(`.${fileExt}`)) rawTitle = rawTitle.slice(0, -(fileExt.length + 1));
+  const safeFilename = `${sanitizeFilename(rawTitle)}.${fileExt}`;
+  const positiveLimit = (value, fallback, maximum) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), maximum) : fallback;
+  };
+  const timeoutMs = positiveLimit(process.env.DOWNLOAD_TIMEOUT_MS, 10 * 60 * 1000, 60 * 60 * 1000);
+  const maxBytes = positiveLimit(process.env.MAX_DOWNLOAD_BYTES, 512 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
+  let tempDir;
+  try {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tubeswift-download-'));
+  } catch (err) {
+    console.error('[ERR] Cannot create download directory:', err.message);
+    return res.status(503).json({ success: false, error: 'Download storage is temporarily unavailable.' });
+  }
+  dlArgs.push('--max-filesize', String(maxBytes), '--print', 'after_move:filepath',
+    '-o', path.join(tempDir, 'media.%(ext)s'), `https://www.youtube.com/watch?v=${videoId}`);
 
-  let headersSent = false;
-  let stderrOutput = '';
-
-  child.stdout.on('data', chunk => {
-    if (!headersSent) {
-      headersSent = true;
-      // Send 200 headers ONLY when real video/audio data is actively flowing
-      res.writeHead(200, {
-        'Content-Disposition': `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`,
-        'Content-Type': contentType,
-        'X-Content-Type-Options': 'nosniff',
-        'Access-Control-Allow-Origin': '*'
-      });
+  let child;
+  let childClosed = false;
+  let responseStarted = false;
+  let cancelled = false;
+  let stopping = false;
+  let cleaned = false;
+  let stdout = '';
+  let stderr = '';
+  let timeout;
+  let sizeMonitor;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (err) {
+      console.warn('[WARN] Could not clean download directory:', err.message);
     }
-    res.write(chunk);
+  };
+  const stopTimers = () => { clearTimeout(timeout); clearInterval(sizeMonitor); };
+  const stopChild = () => {
+    if (stopping || childClosed || !child || !child.pid) return;
+    stopping = true;
+    const signal = sig => {
+      try {
+        if (process.platform !== 'win32') process.kill(-child.pid, sig);
+        else child.kill(sig);
+      } catch (_) {
+        try { child.kill(sig); } catch (_) {}
+      }
+    };
+    signal('SIGTERM');
+    const forceKill = setTimeout(() => signal('SIGKILL'), 2000);
+    forceKill.unref();
+  };
+  const fail = (status, message) => {
+    if (responseStarted || res.destroyed || res.writableEnded) return;
+    responseStarted = true;
+    res.status(status).json({ success: false, error: message });
+  };
+  res.once('close', () => {
+    if (!res.writableFinished) {
+      cancelled = true;
+      stopTimers();
+      stopChild();
+      if (childClosed) cleanup();
+    }
   });
 
-  child.stderr.on('data', data => {
-    const msg = data.toString();
-    stderrOutput += msg;
-    if (!msg.includes('Deprecated Feature') && !msg.includes('NotOpenSSLWarning')) {
-      console.error(`[YTDLP STDERR] ${msg.trim()}`);
-    }
+  try {
+    child = spawn(YTDLP_PATH, dlArgs, { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    cleanup();
+    return fail(503, 'Download service could not start. Please contact the site administrator.');
+  }
+  child.stdout.on('data', data => { stdout = (stdout + data.toString()).slice(-16384); });
+  child.stderr.on('data', data => { stderr = (stderr + data.toString()).slice(-65536); });
+  child.once('error', err => {
+    console.error('[ERR] Download process could not start:', err.message);
+    childClosed = true;
+    stopTimers();
+    cleanup();
+    fail(503, 'Download service could not start. Please contact the site administrator.');
   });
-
-  child.on('error', err => {
-    console.error('[ERR] Process spawn error:', err);
-    if (!headersSent) {
-      res.status(500).send('Download stream failed to initialize.');
+  child.once('close', code => {
+    childClosed = true;
+    stopTimers();
+    if (cancelled || responseStarted || res.destroyed) return cleanup();
+    if (code !== 0) {
+      console.warn(`[WARN] Download failed with code ${code}: ${stderr}`);
+      const failure = describeYtDlpError(stderr);
+      cleanup();
+      return fail(failure.status, failure.message);
     }
-  });
-
-  child.on('close', code => {
-    console.log(`[INFO] Download stream completed with code ${code}`);
-    if (res.writableEnded || res.destroyed) return;
-    if (!headersSent) {
-      // yt-dlp errored before producing any data - do NOT send a 0-byte corrupt file
-      console.error(`[ERR] yt-dlp failed with code ${code} without data: ${stderrOutput}`);
-      const failure = describeYtDlpError(stderrOutput);
-      res.status(failure.status).send(failure.message);
-    } else {
-      res.end();
+    const finalPath = path.resolve(stdout.trim().split(/\r?\n/).pop() || '');
+    try {
+      const stat = fs.lstatSync(finalPath);
+      if (path.dirname(finalPath) !== tempDir || path.extname(finalPath).toLowerCase() !== `.${fileExt}` ||
+          !stat.isFile() || stat.isSymbolicLink() || stat.size === 0 || stat.size > maxBytes) {
+        throw new Error('The output file did not match the requested format or size.');
+      }
+    } catch (err) {
+      console.warn('[WARN] Invalid download output:', err.message);
+      cleanup();
+      return fail(502, 'The requested format could not be prepared. Please refresh the video and choose an available format.');
     }
+    responseStarted = true;
+    const contentType = fileExt === 'mp3' ? 'audio/mpeg' : fileExt === 'm4a' ? 'audio/mp4'
+      : fileExt === 'webm' ? (category === 'audio_only' ? 'audio/webm' : 'video/webm') : 'video/mp4';
+    res.set({ 'Content-Type': contentType, 'X-Content-Type-Options': 'nosniff' });
+    res.download(finalPath, safeFilename, err => {
+      cleanup();
+      if (err && !res.headersSent && !res.destroyed) {
+        res.status(502).json({ success: false, error: 'The prepared file could not be sent. Please try again.' });
+      }
+    });
   });
-
-  // If user cancels download or closes tab, kill child process cleanly
-  res.on('close', () => {
-    if (!res.writableEnded && !child.killed) {
-      console.log('[INFO] Client disconnected, killing download process');
-      child.kill('SIGINT');
-    }
-  });
+  timeout = setTimeout(() => {
+    stopChild();
+    fail(504, 'The download took too long. Please try a shorter video or a lower quality.');
+  }, timeoutMs);
+  timeout.unref();
+  sizeMonitor = setInterval(() => {
+    try {
+      const bytes = fs.readdirSync(tempDir).reduce((total, name) => {
+        const stat = fs.lstatSync(path.join(tempDir, name));
+        return total + (stat.isFile() ? stat.size : 0);
+      }, 0);
+      // Merging temporarily retains source streams beside the finished file.
+      if (bytes > maxBytes * 3) {
+        stopChild();
+        fail(413, 'This download is too large. Please choose a shorter video or a lower quality.');
+      }
+    } catch (_) {}
+  }, 2000);
+  sizeMonitor.unref();
 });
 
 // Serve static frontend assets
