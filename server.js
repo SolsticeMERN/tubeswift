@@ -18,20 +18,33 @@ app.get('/health', (req, res) => {
 });
 
 
-const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+let COOKIES_PATH = fs.existsSync('/etc/secrets/cookies.txt')
+  ? '/etc/secrets/cookies.txt'
+  : path.join(__dirname, 'cookies.txt');
+
+function writeCookies(value) {
+  const normalized = value.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  if (!/^# (?:Netscape HTTP Cookie File|HTTP Cookie File)/.test(normalized)) {
+    throw new Error('Cookies must be an exported Netscape cookie file.');
+  }
+  const targetPath = path.join(__dirname, 'cookies.txt');
+  fs.writeFileSync(targetPath, normalized, { encoding: 'utf-8', mode: 0o600 });
+  try { fs.chmodSync(targetPath, 0o600); } catch (_) {}
+  COOKIES_PATH = targetPath;
+}
 
 // Initialize cookies from environment variables if set (for Render / cloud deployments)
 if (process.env.YOUTUBE_COOKIES_BASE64) {
   try {
     const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
-    fs.writeFileSync(COOKIES_PATH, decoded, 'utf-8');
+    writeCookies(decoded);
     console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES_BASE64 env.');
   } catch (err) {
     console.error('[ERR] Failed to decode YOUTUBE_COOKIES_BASE64:', err);
   }
 } else if (process.env.YOUTUBE_COOKIES) {
   try {
-    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf-8');
+    writeCookies(process.env.YOUTUBE_COOKIES);
     console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES env.');
   } catch (err) {
     console.error('[ERR] Failed to write YOUTUBE_COOKIES:', err);
@@ -41,9 +54,9 @@ if (process.env.YOUTUBE_COOKIES_BASE64) {
 // Locate yt-dlp executable
 function getYtDlpPath() {
   const possiblePaths = [
-    path.join(__dirname, 'yt-dlp_macos'),
+    ...(process.platform === 'darwin' ? [path.join(__dirname, 'yt-dlp_macos')] : []),
     path.join(__dirname, 'yt-dlp'),
-    '/tmp/yt-dlp_macos',
+    ...(process.platform === 'darwin' ? ['/tmp/yt-dlp_macos'] : []),
     '/Users/shakilsarker/Library/Python/3.9/bin/yt-dlp',
     'yt-dlp',
     '/usr/local/bin/yt-dlp',
@@ -65,19 +78,27 @@ function getYtDlpPath() {
 const YTDLP_PATH = getYtDlpPath();
 console.log(`[INFO] Using yt-dlp at: ${YTDLP_PATH}`);
 
-// Helper to assemble standard yt-dlp arguments (Node JS challenge solver + cookies + web_embedded client)
+// Let yt-dlp select compatible YouTube clients for the current release.
 function getBaseYtDlpArgs() {
   const args = [
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
-    '--extractor-args', 'youtube:player_client=web_embedded,tv_samsung',
-    '--no-warnings',
     '--no-playlist'
   ];
   if (fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
   }
   return args;
+}
+
+function describeYtDlpError(stderr) {
+  if (/sign in to confirm|not a bot|cookies are no longer valid/i.test(stderr)) {
+    return {
+      status: 503,
+      message: 'YouTube rejected the server session. The site administrator must refresh the YouTube cookies and check whether the hosting IP is blocked. Choosing another format will not fix this.'
+    };
+  }
+  return { status: 502, message: 'YouTube could not provide this video. It may be unavailable or restricted. Please try again later.' };
 }
 
 // Helper to format duration seconds to MM:SS or HH:MM:SS
@@ -153,58 +174,16 @@ app.get('/api/info', async (req, res) => {
     stderrData += chunk.toString();
   });
 
-  proc.on('close', async (code) => {
-    if (code !== 0 || !stdoutData.trim()) {
-      console.warn(`[WARN] android_vr yt-dlp exited with code ${code}. Error: ${stderrData}`);
-      
-      // Fallback: Try YouTube oEmbed API to at least return video metadata
-      try {
-        const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(cleanUrl)}&format=json`;
-        const oembedRes = await fetch(oembedUrl);
-        if (oembedRes.ok) {
-          const odata = await oembedRes.json();
-          return res.json({
-            success: true,
-            data: {
-              id: videoId,
-              title: odata.title,
-              author: odata.author_name,
-              authorUrl: odata.author_url,
-              thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-              duration: 215,
-              durationFormatted: '3:35',
-              views: null,
-              readyFormats: [
-                { id: 'ready-1080p', format_id: 'bestvideo[height<=1080]+bestaudio/18', label: '1080p Full HD MP4', quality: '1080p Full HD', resolution: '1920x1080', ext: 'mp4', height: 1080, size: '42.5 MB', category: 'ready' },
-                { id: 'ready-720p', format_id: 'bestvideo[height<=720]+bestaudio/18', label: '720p HD MP4', quality: '720p HD', resolution: '1280x720', ext: 'mp4', height: 720, size: '24.8 MB', category: 'ready' },
-                { id: 'ready-360p', format_id: '18', label: '★ 360p MP4 — Recommended', quality: '360p SD', resolution: '640x360', ext: 'mp4', height: 360, size: '13.3 MB', category: 'ready', isRecommended: true }
-              ],
-              highQualityFormats: [
-                { id: '1080p-mp4', format_id: 'bestvideo[height=1080]', label: '1080p MP4 (Full HD)', quality: '1080p FHD', resolution: '1920x1080', ext: 'mp4', height: 1080, size: '38.4 MB', category: 'video_high' },
-                { id: '720p-mp4', format_id: 'bestvideo[height=720]', label: '720p MP4 (HD)', quality: '720p HD', resolution: '1280x720', ext: 'mp4', height: 720, size: '22.1 MB', category: 'video_high' },
-                { id: '480p-mp4', format_id: 'bestvideo[height=480]', label: '480p MP4 (Standard)', quality: '480p SD', resolution: '854x480', ext: 'mp4', height: 480, size: '14.5 MB', category: 'video_high' },
-                { id: '360p-mp4', format_id: 'bestvideo[height=360]', label: '360p MP4', quality: '360p SD', resolution: '640x360', ext: 'mp4', height: 360, size: '9.3 MB', category: 'video_high' }
-              ],
-              mp3Formats: [
-                { id: 'mp3-320', format_id: 'bestaudio/18', label: 'MP3 · 320 kbps (Studio Quality)', quality: '320 kbps', bitrate: '320k', ext: 'mp3', size: '≈ 8.5 MB', category: 'mp3' },
-                { id: 'mp3-192', format_id: 'bestaudio/18', label: 'MP3 · 192 kbps (Standard Quality)', quality: '192 kbps', bitrate: '192k', ext: 'mp3', size: '≈ 5.1 MB', category: 'mp3' },
-                { id: 'mp3-128', format_id: 'bestaudio/18', label: 'MP3 · 128 kbps (Compact / Mobile)', quality: '128 kbps', bitrate: '128k', ext: 'mp3', size: '≈ 3.4 MB', category: 'mp3' }
-              ],
-              nativeAudioFormats: [
-                { id: 'audio-m4a', format_id: '140/18', label: 'M4A Audio · 131 kbps (Original Apple AAC)', quality: 'M4A AAC', bitrate: '131k', ext: 'm4a', size: '3.6 MB', category: 'audio_only' }
-              ],
-              isFallback: true
-            }
-          });
-        }
-      } catch (fallbackErr) {
-        console.error('[ERR] Fallback failed:', fallbackErr);
-      }
+  proc.on('error', () => {
+    if (!res.headersSent) res.status(503).json({ success: false, error: 'Video service could not start. Please contact the site administrator.' });
+  });
 
-      return res.status(500).json({
-        success: false,
-        error: 'Unable to fetch video details. YouTube might be temporarily rate-limiting this request or the video is private/restricted.'
-      });
+  proc.on('close', async (code) => {
+    if (res.headersSent || res.destroyed) return;
+    if (code !== 0 || !stdoutData.trim()) {
+      console.warn(`[WARN] yt-dlp exited with code ${code}. Error: ${stderrData}`);
+      const failure = describeYtDlpError(stderrData);
+      return res.status(failure.status).json({ success: false, error: failure.message });
     }
 
     try {
@@ -428,7 +407,7 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
       );
     } else {
       // 1080p / 720p merged with audio via ffmpeg
-      const h = height || (format.includes('1080') ? 1080 : 720);
+      const h = height || (String(format || '').includes('1080') ? 1080 : 720);
       dlArgs.push(
         '--ffmpeg-location', FFMPEG_PATH,
         '-f', `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/18/best`,
@@ -484,18 +463,20 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
 
   child.on('close', code => {
     console.log(`[INFO] Download stream completed with code ${code}`);
+    if (res.writableEnded || res.destroyed) return;
     if (!headersSent) {
       // yt-dlp errored before producing any data - do NOT send a 0-byte corrupt file
       console.error(`[ERR] yt-dlp failed with code ${code} without data: ${stderrOutput}`);
-      res.status(500).send(`Unable to process video stream (YouTube Code ${code}). Please try another format.`);
+      const failure = describeYtDlpError(stderrOutput);
+      res.status(failure.status).send(failure.message);
     } else {
       res.end();
     }
   });
 
   // If user cancels download or closes tab, kill child process cleanly
-  req.on('close', () => {
-    if (!child.killed) {
+  res.on('close', () => {
+    if (!res.writableEnded && !child.killed) {
       console.log('[INFO] Client disconnected, killing download process');
       child.kill('SIGINT');
     }
