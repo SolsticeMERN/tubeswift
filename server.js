@@ -5,10 +5,15 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const { buildVideoInfo } = require('./lib/video-info');
+const { UpstreamGuard } = require('./lib/upstream-guard');
 const FFMPEG_PATH = require('ffmpeg-static') || 'ffmpeg';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const upstreamGuard = new UpstreamGuard();
+// Public downloads must not depend on the owner's rotating browser login.
+// Account access is an explicit deployment choice, never an automatic fallback.
+const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE === 'cookies';
 
 app.use(cors());
 app.use(express.json());
@@ -43,41 +48,45 @@ function writeCookies(value) {
 }
 
 // Initialize cookies from environment variables if set (for Render / cloud deployments)
-const cookieSources = [
-  process.env.YOUTUBE_COOKIES_BASE64 && 'YOUTUBE_COOKIES_BASE64',
-  process.env.YOUTUBE_COOKIES && 'YOUTUBE_COOKIES',
-  fs.existsSync(RENDER_COOKIES_PATH) && RENDER_COOKIES_PATH
-].filter(Boolean);
-if (cookieSources.length > 1) {
-  console.warn(`[WARN] Multiple YouTube cookie sources configured. Using ${cookieSources[0]}; remove older sources before refreshing a lower-priority source.`);
-}
-if (process.env.YOUTUBE_COOKIES_BASE64) {
-  try {
-    const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
-    writeCookies(decoded);
-    console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES_BASE64 env.');
-  } catch (err) {
-    console.error('[ERR] Failed to decode YOUTUBE_COOKIES_BASE64:', err);
+if (USE_COOKIES) {
+  const cookieSources = [
+    process.env.YOUTUBE_COOKIES_BASE64 && 'YOUTUBE_COOKIES_BASE64',
+    process.env.YOUTUBE_COOKIES && 'YOUTUBE_COOKIES',
+    fs.existsSync(RENDER_COOKIES_PATH) && RENDER_COOKIES_PATH
+  ].filter(Boolean);
+  if (cookieSources.length > 1) {
+    console.warn(`[WARN] Multiple YouTube cookie sources configured. Using ${cookieSources[0]}; remove older sources before refreshing a lower-priority source.`);
   }
-} else if (process.env.YOUTUBE_COOKIES) {
-  try {
-    writeCookies(process.env.YOUTUBE_COOKIES);
-    console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES env.');
-  } catch (err) {
-    console.error('[ERR] Failed to write YOUTUBE_COOKIES:', err);
-  }
-} else {
-  const source = fs.existsSync(RENDER_COOKIES_PATH) ? RENDER_COOKIES_PATH : LOCAL_COOKIES_PATH;
-  if (fs.existsSync(source)) {
+  if (process.env.YOUTUBE_COOKIES_BASE64) {
     try {
-      writeCookies(fs.readFileSync(source, 'utf-8'));
-      console.log(`[INFO] Loaded YouTube cookies from ${source} into a writable runtime copy.`);
+      const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
+      writeCookies(decoded);
+      console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES_BASE64 env.');
     } catch (err) {
-      console.error('[ERR] Failed to load YouTube cookie file:', err.message);
+      console.error('[ERR] Failed to decode YOUTUBE_COOKIES_BASE64:', err);
+    }
+  } else if (process.env.YOUTUBE_COOKIES) {
+    try {
+      writeCookies(process.env.YOUTUBE_COOKIES);
+      console.log('[INFO] Loaded YouTube cookies from YOUTUBE_COOKIES env.');
+    } catch (err) {
+      console.error('[ERR] Failed to write YOUTUBE_COOKIES:', err);
+    }
+  } else {
+    const source = fs.existsSync(RENDER_COOKIES_PATH) ? RENDER_COOKIES_PATH : LOCAL_COOKIES_PATH;
+    if (fs.existsSync(source)) {
+      try {
+        writeCookies(fs.readFileSync(source, 'utf-8'));
+        console.log(`[INFO] Loaded YouTube cookies from ${source} into a writable runtime copy.`);
+      } catch (err) {
+        console.error('[ERR] Failed to load YouTube cookie file:', err.message);
+      }
     }
   }
+  if (!COOKIES_PATH) console.warn('[WARN] No valid YouTube cookie file loaded. Requests will use a guest session.');
+} else {
+  console.log('[INFO] Public YouTube downloads use a guest session. Saved account cookies are disabled; set YOUTUBE_AUTH_MODE=cookies only for an intentional account-backed deployment.');
 }
-if (!COOKIES_PATH) console.warn('[WARN] No valid YouTube cookie file loaded. Requests will use a guest session.');
 if (Number(process.versions.node.split('.')[0]) < 22) {
   console.warn('[WARN] YouTube JavaScript challenge solving requires Node.js 22 or newer.');
 }
@@ -127,11 +136,15 @@ function getBaseYtDlpArgs() {
 }
 
 function describeYtDlpError(stderr) {
+  upstreamGuard.recordFailure(stderr);
+  if (/HTTP Error 429/i.test(stderr)) {
+    return { status: 503, code: 'YOUTUBE_RATE_LIMITED', retryAfter: 120, message: 'YouTube is temporarily limiting downloads from this server. Please try again in 2 minutes.' };
+  }
   if (/cookies are no longer valid|cookies.*(?:expired|invalid)/i.test(stderr)) {
     return { status: 503, code: 'YOUTUBE_COOKIES_EXPIRED', message: 'The server YouTube login has expired. The site administrator needs to refresh the saved session.' };
   }
-  if (/sign in to confirm|not a bot|HTTP Error 429/i.test(stderr)) {
-    return { status: 503, code: 'YOUTUBE_SESSION_REJECTED', message: 'YouTube is currently rejecting requests from this server. Please try again later.' };
+  if (/sign in to confirm|not a bot/i.test(stderr)) {
+    return { status: 503, code: 'YOUTUBE_SESSION_REJECTED', retryAfter: 120, message: 'YouTube is currently rejecting requests from this server. Please try again later.' };
   }
   if (/private video|video unavailable|video is unavailable|has been removed|not available in your country/i.test(stderr)) {
     return { status: 404, code: 'VIDEO_UNAVAILABLE', message: 'This video is unavailable, private, or restricted.' };
@@ -154,6 +167,29 @@ function extractVideoId(url) {
   const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([\w-]{11})/);
   return match ? match[1] : null;
 }
+
+// Bound CPU/memory use and avoid repeatedly contacting an upstream that has
+// rejected this instance. Queued requests can be cancelled and cannot grow
+// without limit. This is a capacity guard, not a durable background job queue.
+app.use(['/api/info', '/api/download'], async (req, res, next) => {
+  if (req.method !== 'GET' || !extractVideoId(req.query.url)) return next();
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  res.once('close', abort);
+  try {
+    const release = await upstreamGuard.acquire(controller.signal);
+    res.off('close', abort);
+    if (res.destroyed) { release(); return; }
+    res.once('finish', release);
+    res.once('close', release);
+    return next();
+  } catch (err) {
+    res.off('close', abort);
+    if (err.code === 'ABORTED' || res.destroyed) return;
+    res.set('Retry-After', String(err.retryAfter || 10));
+    return res.status(503).json({ success: false, code: err.code, retryAfter: err.retryAfter || 10, error: err.message });
+  }
+});
 
 // API: Get Video Information & Available Formats
 app.get('/api/info', (req, res) => {
@@ -203,6 +239,7 @@ app.get('/api/info', (req, res) => {
     if (code !== 0 || !stdout.trim()) {
       console.warn(`[WARN] YouTube extraction failed for ${videoId}: ${stderr}`);
       const failure = describeYtDlpError(stderr);
+      if (failure.retryAfter) res.set('Retry-After', String(failure.retryAfter));
       return res.status(failure.status).json({ success: false, code: failure.code, error: failure.message });
     }
     try {
@@ -362,6 +399,7 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     if (code !== 0) {
       console.warn(`[WARN] Download failed with code ${code}: ${stderr}`);
       const failure = describeYtDlpError(stderr);
+      if (failure.retryAfter) res.set('Retry-After', String(failure.retryAfter));
       cleanup();
       return fail(failure.status, failure.message);
     }
