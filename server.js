@@ -83,7 +83,7 @@ function getBaseYtDlpArgs() {
   const args = [
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
-    '--extractor-args', 'youtube:player_client=android,ios,visionos,web',
+    '--extractor-args', 'youtube:player_skip=webpage,configs;player_client=android,ios,visionos',
     '--no-playlist'
   ];
   if (fs.existsSync(COOKIES_PATH)) {
