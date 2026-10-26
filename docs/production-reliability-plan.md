@@ -2,13 +2,15 @@
 
 Reviewed: 26 October 2026 (Asia/Dhaka).
 
+The [competitor architecture research](competitor-architecture-research.md) contains the current acquisition recommendation and source-backed findings. This remains a proposal, not a production migration record.
+
 ## Current state
 
 - Public frontend: https://www.tubeswift.app/.
 - Download backend: a single Render Free web service (0.1 CPU, 512 MB RAM).
-- The backend uses one exported YouTube account session for all visitors.
+- Current checkout loads configured account cookies unless `YOUTUBE_AUTH_MODE=guest`. Verify deployed settings independently; configured credentials are not a durable public-service dependency.
 - Real MP4 and MP3 downloads and 18 automated tests passed after a session refresh. This establishes that the repaired paths work; it is not a production load or availability test.
-- Each request launches yt-dlp independently. There is no global concurrency limit, durable job queue, independent download backend, or download success monitoring.
+- Requests launch yt-dlp behind a bounded in-process concurrency guard/cooldown. Metadata has a bounded in-memory cache. There is still no durable job queue, qualified independent download backend, or download success monitoring.
 - `/health` checks the Node process only. It does not establish that YouTube extraction, conversion, and file delivery work.
 - Installation downloads the latest yt-dlp release. A redeploy can therefore change an external dependency without a separate qualification run.
 
@@ -20,7 +22,7 @@ There is no permanent cookie value. A managed provider must also be tested: a pa
 
 ## Recommended launch sequence
 
-1. Use an always-on service. The existing Render dashboard offers 1 CPU / 2 GB RAM for $25 per month. This is a proposed initial compute size, not a verified load capacity. No upgrade has been made.
+1. Qualify acquisition with a maintained yt-dlp/runtime/EJS set and an automatic PO Token Provider. Test real file delivery on the hosted route. If that route is still rejected, qualify an alternative with matching session/network context. Choose always-on worker capacity from measured load; do not assume a $25 hosting upgrade resolves extraction.
 2. Move downloads into jobs. Store job state in a durable queue, limit concurrent extraction/conversion, coalesce duplicate requests, and give visitors an honest queued/preparing/ready status. A restart should not silently lose an accepted request.
 3. Resolve the acquisition dependency. Evaluate an actively maintained extraction integration and, if justified, a separate managed backend. Test real file delivery, required quality, session/IP restrictions, costs, permitted use, limits, and support terms before purchasing or integrating. Avoid depending on the owner's personal browser session for anonymous public traffic.
 4. Store completed files privately for a short, bounded period, with automatic deletion and expiring delivery links. Do not share private or account-restricted results between visitors. Use short-lived metadata caching and refresh stale format information.
@@ -31,9 +33,9 @@ There is no permanent cookie value. A managed provider must also be tested: a pa
 
 ## Budget planning
 
-- Known compute option: $25/month for the Render service described above.
+- The Render dashboard previously showed $7 and $25 monthly service compute options. These are capacity options, not verified total costs or fixes for upstream rejection.
 - Queue, storage, transfer, monitoring, and any external download backend are additional. Their costs have not been quoted or approved.
-- Reserve a provisional $25–$50/month beyond compute for a small launch, but do not treat this as a total-price guarantee. Acquisition or bandwidth requirements could exceed it.
+- No total monthly estimate is established until a working acquisition route and transferred bytes per completed job have been measured.
 - Example delivery volume: 100 downloads/day at 50 MB each is about 150 GB/month. At 1,000/day it is about 1.5 TB/month. Actual volume must be measured; proxying media may incur separate transfer charges.
 - Do not purchase a provider or upgrade hosting until the exact charge and scope are approved.
 

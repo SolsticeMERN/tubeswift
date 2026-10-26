@@ -1,7 +1,7 @@
 # TubeSwift Master Architecture & Scaling Plan
 
 > **Last Updated:** October 26, 2026  
-> **Status:** Phase 1 (Active Production - Month 1 Zero-Cost Launch)  
+> **Status:** Public launch; upstream download reliability unresolved
 > **Live Site:** [https://www.tubeswift.app/](https://www.tubeswift.app/)  
 > **Backend:** [https://tubeswift-kri3.onrender.com](https://tubeswift-kri3.onrender.com)  
 
@@ -10,11 +10,11 @@
 ## 1. Executive Summary & Core Strategy
 
 ### The Month 1 Decision: Stay Free vs. Upgrade
-* **Recommendation:** **Stay on the Free Plan for Month 1.**
+* **Recommendation:** Qualify a working acquisition backend before choosing hosting capacity or buying proxy bandwidth. See the [competitor architecture research](competitor-architecture-research.md) for the evidence and implementation sequence.
 * **Why not pay Render $25/month right now?**
   * Render's $25/month plan only gives more RAM/CPU. **It does NOT stop YouTube from blocking datacenter IPs.**
-  * Upgrading server specs without residential proxy routing is paying for idle hardware while still facing the same upstream YouTube anti-bot hurdles.
-  * In Month 1, traffic is low. We can keep Render awake 24/7 for **$0** using an automated uptime monitor.
+  * CPU/RAM capacity and upstream network access are separate problems. Residential routing is one possible component to qualify, not a mandatory or guaranteed cure.
+  * An uptime monitor may affect idle shutdowns, but cannot guarantee availability. Render explicitly advises against Free instances for production: [Free limitations](https://render.com/docs/free).
 
 ---
 
@@ -32,16 +32,17 @@
        ├── Express 5.x Server (Node.js)
        ├── yt-dlp (Latest Linux standalone release)
        ├── ejs:github + Node.js (Solves YouTube JavaScript challenges)
-       ├── Secret Session: Netscape cookies from YOUTUBE_COOKIES_BASE64
-       └── ffmpeg-static (Muxes separate 1080p video + audio streams on the fly)
+       ├── Optional configured Netscape session cookies (disabled by YOUTUBE_AUTH_MODE=guest)
+       ├── In-process upstream concurrency guard/cooldown and metadata cache
+       └── ffmpeg-static (Completes conversion/merging before serving a file)
        │
-       ▼ (Mobile InnerTube API)
+       ▼ (yt-dlp-selected YouTube clients)
 [ YouTube Video & Audio CDN ]
 ```
 
 ### Key Technical Safeguards In Place:
-1. **Player Clients:** Configured with `web,mweb,web_embedded` with Node.js challenge solving (`--js-runtimes node --remote-components ejs:github`).
-2. **Compact Cookies:** Filtered down from 575 KB to only the ~21 active YouTube cookies (~2.9 KB Base64) to strictly observe Render's 32 KB environment limit.
+1. **Player Clients:** yt-dlp selects clients; Node.js/EJS solves player JavaScript challenges. No automatic PO Token Provider is currently integrated.
+2. **Cookies:** Configured cookies are loaded unless guest mode is set. Account sessions can expire or be rejected; they do not guarantee public-service availability.
 3. **Decoupled Architecture:** Vercel serves the high-speed cached UI; Render handles only heavy extraction/conversion.
 4. **Clean UI & Responsive Nav:** Single-line `white-space: nowrap` responsive navigation bar across all display resolutions.
 
@@ -55,51 +56,36 @@
 * **Infrastructure:**
   * **Frontend:** Vercel Hobby (Free, global CDN).
   * **Backend:** Render Free Web Service ($0).
-  * **Cold Start Prevention:** Free [UptimeRobot](https://uptimerobot.com) HTTP ping to `https://tubeswift-kri3.onrender.com/health` every 5 minutes (prevents the 15-minute idle sleep).
-  * **Session Management:** Secondary throwaway Google account cookie refreshed as needed.
+  * **Health:** `/health` checks the Node process. No monitor installation is established by this plan, and process health does not verify downloads.
+  * **Acquisition:** Qualify automatic PO tokens and the hosted network route. A manual account-cookie refresh is a diagnostic intervention, not a reliability architecture.
 
 ### 🟡 Phase 2: Early Growth (50 – 500 Downloads / Day)
-* **Trigger:** Daily traffic grows consistently; YouTube starts throttling the single Render IP.
-* **Budget:** **$10 – $30 / month**
+* **Trigger:** Measured demand and tested acquisition requirements justify recurring costs. The hosted route has already received upstream rejections; this does not require large visitor volume.
+* **Budget:** Undetermined until bytes per completed download, permitted routes, and supplier pricing are measured.
 * **Upgrade Path:**
-  * **DO NOT** spend on big server RAM first. Spend on **Proxy Rotation**:
-    * Integrate a low-cost rotating proxy (e.g. Webshare rotating proxies for ~$5-$10/mo) into `yt-dlp` using `--proxy`.
-    * This routes download requests through residential/ISP IPs, permanently eliminating YouTube 429 datacenter IP blocks.
+  * Qualify the maintained extractor/runtime/EJS and automatic PO Token Provider first. If the hosted network is still rejected, qualify an alternate route and preserve the required session/IP context throughout each job.
+    * A proxy must explicitly support the target and media transfer, with measured bandwidth and a spending cap.
+    * No proxy permanently eliminates YouTube blocks. The earlier claim in this document was incorrect. [Provider limitations](https://github.com/Brainicism/bgutil-ytdlp-pot-provider).
   * If Render memory hits 512 MB limits due to multiple simultaneous 1080p ffmpeg merges, upgrade Render to Starter ($7/mo) or standard compute ($25/mo).
 
 ### 🔴 Phase 3: Scale (> 1,000 Downloads / Day)
 * **Trigger:** Site ranks on Google for target keywords; high concurrent download traffic.
-* **Budget:** **$50 – $120 / month**
+* **Budget:** Measured compute, storage, transfer, and acquisition costs; no fixed total has been established.
 * **Upgrade Path:**
-  * Move from single-server stream piping to a **Worker Queue (Redis / BullMQ)** on a dedicated VPS (Hetzner / DigitalOcean, $10-$20/mo).
-  * Save converted MP4s temporarily to Cloudflare R2 ($0 egress bandwidth) and provide direct pre-signed download links to users.
-  * This prevents the server network from saturating on large file deliveries.
+  * Use durable worker jobs, bounded concurrency, and validated short-lived file storage with expiring delivery links. Qualify these before a production reliability claim, rather than waiting for 1,000 downloads/day.
+  * Select storage and hosting only after checking current limits and pricing. Independent delivery reduces worker transfer load but cannot repair first-time acquisition failures.
 
 ---
 
 ## 4. Operational Emergency Runbook
 
 ### Issue A: YouTube shows "Sign in to confirm you're not a bot"
-* **Cause:** The exported Google cookies expired or were rotated by Google.
-* **Resolution (60 seconds):**
-  1. Open Chrome on Mac, log into the throwaway Google account on YouTube.
-  2. Run in terminal:
-     ```bash
-     ./yt-dlp_macos --cookies-from-browser chrome --cookies cookies_raw.txt "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --skip-download
-     ```
-  3. Filter to YouTube cookies and copy Base64 to clipboard:
-     ```bash
-     python3 -c "
-     with open('cookies_raw.txt') as f: lines = f.readlines()
-     yt = [l for l in lines if l.startswith('.youtube.com')]
-     with open('cookies.txt', 'w') as f: f.write('# Netscape HTTP Cookie File\n\n' + ''.join(yt))
-     " && rm cookies_raw.txt && base64 -i cookies.txt | pbcopy
-     ```
-  4. Paste into Render Dashboard ➔ **Environment** ➔ `YOUTUBE_COOKIES_BASE64` ➔ **Save Changes**.
+* **Possible causes:** Rejected network/IP, guest/account restrictions, or invalid session credentials. This message alone does not prove cookie expiry.
+* **Resolution:** Inspect the underlying status and extractor diagnostics, respect the cooldown, and verify the token provider and network route. Refresh cookies only when evidence identifies an invalid account session. Do not export unrelated browser cookies or repeatedly retry a blocked route. See [operations](youtube-operations.md) and [research](competitor-architecture-research.md).
 
 ### Issue B: First download takes 50+ seconds
 * **Cause:** Render free instance went to sleep due to 15 minutes of inactivity.
-* **Resolution:** Ensure UptimeRobot is active and pinging `https://tubeswift-kri3.onrender.com/health` every 5 minutes.
+* **Resolution:** Confirm idle shutdown in logs. A production always-on worker removes this particular Free-tier limitation; it does not remove YouTube restrictions. Heartbeats do not guarantee availability.
 
 ---
 

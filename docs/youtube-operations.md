@@ -1,8 +1,8 @@
 # YouTube request handling
 
-Public downloads use a guest session by default. Existing `YOUTUBE_COOKIES_BASE64`, `YOUTUBE_COOKIES`, and cookie files are not loaded unless `YOUTUBE_AUTH_MODE=cookies` is explicitly set. This avoids dependence on the owner's rotating browser login. Account-only, private, and age-restricted content is not guaranteed by the public download service.
+The current checkout loads configured `YOUTUBE_COOKIES_BASE64`, `YOUTUBE_COOKIES`, or cookie files unless `YOUTUBE_AUTH_MODE=guest` is explicitly set. With no valid cookie source it uses a guest session. This changed after the earlier guest-default deployment; verify deployed configuration independently. Account-only, private, and age-restricted content is not guaranteed by the public download service.
 
-The older session-refresh instructions in the master plan describe the previous account-backed configuration. Refreshing an account is not a remedy for a hosting-network HTTP 429 restriction.
+Refreshing an account is not a remedy for a hosting-network HTTP 429 restriction. Follow the [competitor architecture research](competitor-architecture-research.md) for automatic token integration and route qualification; these remain proposed work.
 
 The backend runs one extraction or download request at a time per Node process. Up to four requests can wait for up to 30 seconds. This protects the small instance from unbounded subprocess creation. It is a capacity safeguard, not a durable job queue or a scalable worker system.
 

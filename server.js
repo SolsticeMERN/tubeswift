@@ -135,11 +135,22 @@ function getBaseYtDlpArgs() {
   if (COOKIES_PATH && fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
   }
+  if (process.env.YTDLP_PROXY) {
+    args.push('--proxy', process.env.YTDLP_PROXY);
+  }
   return args;
 }
 
 function describeYtDlpError(stderr) {
+  // Let the guard evaluate whether this is a genuine network-level block.
+  // The guard itself now skips cooldown when stderr also contains "unavailable".
   upstreamGuard.recordFailure(stderr);
+  // Check video-specific errors first — an unavailable/private/deleted video
+  // may also trigger a 429 when yt-dlp retries multiple player clients.
+  // The user should see "video unavailable", not "server rate limited".
+  if (/private video|video unavailable|video is unavailable|has been removed|not available in your country/i.test(stderr)) {
+    return { status: 404, code: 'VIDEO_UNAVAILABLE', message: 'This video is unavailable, private, or restricted.' };
+  }
   if (/HTTP Error 429/i.test(stderr)) {
     return { status: 503, code: 'YOUTUBE_RATE_LIMITED', retryAfter: 120, message: 'YouTube is temporarily limiting downloads from this server. Please try again in 2 minutes.' };
   }
@@ -148,9 +159,6 @@ function describeYtDlpError(stderr) {
   }
   if (/sign in to confirm|not a bot/i.test(stderr)) {
     return { status: 503, code: 'YOUTUBE_SESSION_REJECTED', retryAfter: 120, message: 'YouTube is currently rejecting requests from this server. Please try again later.' };
-  }
-  if (/private video|video unavailable|video is unavailable|has been removed|not available in your country/i.test(stderr)) {
-    return { status: 404, code: 'VIDEO_UNAVAILABLE', message: 'This video is unavailable, private, or restricted.' };
   }
   return { status: 502, code: 'YOUTUBE_REQUEST_FAILED', message: 'YouTube could not provide this video. Please try again later.' };
 }
