@@ -13,9 +13,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const upstreamGuard = new UpstreamGuard();
 const videoInfoCache = new VideoInfoCache({ ttlMs: 60 * 60 * 1000, maxItems: 300 });
-// Public downloads must not depend on the owner's rotating browser login.
-// Account access is an explicit deployment choice, never an automatic fallback.
-const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE === 'cookies';
+// Public downloads can run in guest mode or use configured session cookies.
+// Uses configured cookies (e.g. YOUTUBE_COOKIES_BASE64 on Render) if present,
+// unless YOUTUBE_AUTH_MODE=guest is explicitly set.
+const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE !== 'guest';
 
 app.use(cors());
 app.use(express.json());
@@ -87,7 +88,7 @@ if (USE_COOKIES) {
   }
   if (!COOKIES_PATH) console.warn('[WARN] No valid YouTube cookie file loaded. Requests will use a guest session.');
 } else {
-  console.log('[INFO] Public YouTube downloads use a guest session. Saved account cookies are disabled; set YOUTUBE_AUTH_MODE=cookies only for an intentional account-backed deployment.');
+  console.log('[INFO] Public YouTube downloads use a guest session (YOUTUBE_AUTH_MODE=guest).');
 }
 if (Number(process.versions.node.split('.')[0]) < 22) {
   console.warn('[WARN] YouTube JavaScript challenge solving requires Node.js 22 or newer.');
