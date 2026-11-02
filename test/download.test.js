@@ -22,8 +22,11 @@ function deferred() {
 
 async function setup(t, behavior, env = {}) {
   const app = express();
+  app.use('/api/download', require('../lib/browser-download-errors').browserDownloadErrors);
   const calls = [];
   const signals = [];
+  const guard = new (require('../lib/upstream-guard').UpstreamGuard)();
+  const cache = new (require('../lib/video-cache').VideoInfoCache)();
   const spawn = (executable, args, options) => {
     const child = new EventEmitter();
     child.pid = 900000 + calls.length;
@@ -54,11 +57,12 @@ async function setup(t, behavior, env = {}) {
       }
     },
     getBaseYtDlpArgs: () => ['--no-playlist'],
+    upstreamGuard: guard,
+    videoInfoCache: cache,
+    redactDiagnostic: require('../lib/youtube-errors').redactDiagnostic,
     extractVideoId: url => typeof url === 'string' && /(?:youtu\.be\/|watch\?v=)([\w-]{11})/.exec(url)?.[1],
     sanitizeFilename: name => name.replace(/[^\w -]/g, '').trim().replace(/\s+/g, '_') || 'video',
-    describeYtDlpError: stderr => /not a bot/i.test(stderr)
-      ? { status: 503, message: 'YouTube rejected the server session.' }
-      : { status: 502, message: 'The download failed.' },
+    describeYtDlpError: stderr => guard.recordFailure(stderr),
     console: { log() {}, warn() {}, error() {} },
     setTimeout, clearTimeout, setInterval, clearInterval
   });
@@ -71,7 +75,7 @@ async function setup(t, behavior, env = {}) {
     calls.forEach(call => fs.rmSync(call.directory, { recursive: true, force: true }));
   });
   const url = params => `${base}?${new URLSearchParams({ url: 'https://youtu.be/abcdefghijk', ...params })}`;
-  return { url, calls, signals };
+  return { url, calls, signals, guard, cache };
 }
 
 test('MP3 waits for successful conversion and accepts the bitrate used by older row buttons', async t => {
@@ -205,4 +209,41 @@ test('closing the HTTP request kills the process group and cleans its directory'
   }
   assert.equal(fixture.signals[0].pid, -fixture.calls[0].child.pid);
   assert.equal(fs.existsSync(fixture.calls[0].directory), false);
+});
+
+test('browser download failures stay in a protected frame while API failures remain JSON', async t => {
+  const f = await setup(t, call => {
+    call.child.stderr.write('Sign in to confirm you are not a bot');
+    call.child.emit('close', 1);
+  });
+  const id = 'a'.repeat(32);
+  const response = await fetch(f.url({ ext: 'mp3', category: 'mp3', delivery: 'frame', deliveryId: id, deliveryOrigin: 'https://www.tubeswift.app' }));
+  assert.equal(response.status, 503);
+  assert.match(response.headers.get('content-type'), /text\/html/);
+  assert.match(response.headers.get('content-security-policy'), /frame-ancestors https:\/\/www.tubeswift.app/);
+  assert.match(await response.text(), /parent.postMessage\(.+YouTube is temporarily rejecting downloads/);
+  const api = await fetch(f.url({ ext: 'mp3', category: 'mp3' }));
+  assert.equal(api.status, 503);
+  assert.equal((await api.json()).success, false);
+});
+
+test('malformed frame parameters cannot inject executable HTML', async t => {
+  const f = await setup(t, call => call.child.emit('close', 1));
+  const response = await fetch(f.url({ ext: 'invalid', delivery: 'frame', deliveryId: '\"><script>bad()</script>', deliveryOrigin: 'javascript:bad()' }));
+  assert.equal(response.status, 400);
+  assert.match(response.headers.get('content-type'), /application\/json/);
+  assert.equal((await response.json()).success, false);
+});
+
+test('stale selections invalidate cached formats and return a refreshable error', async t => {
+  const f = await setup(t, call => {
+    call.child.stderr.write('ERROR: Requested format is not available');
+    call.child.emit('close', 1);
+  });
+  f.cache.set('abcdefghijk', { title: 'stale metadata' });
+  const response = await fetch(f.url({ ext: 'mp3', category: 'mp3' }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'VIDEO_FORMATS_CHANGED');
+  assert.equal(f.cache.get('abcdefghijk'), null);
+  assert.equal(f.guard.blockedUntil, 0);
 });

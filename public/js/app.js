@@ -71,6 +71,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnCopyShareLink = document.getElementById('btnCopyShareLink');
 
   let currentVideoData = null;
+  const pendingDownloads = new Map();
+  const apiOrigin = new URL(API_BASE || '/', window.location.href).origin;
+  window.addEventListener('message', event => {
+    const message = event.data;
+    if (event.origin !== apiOrigin || message?.source !== 'tubeswift-download') return;
+    const pending = pendingDownloads.get(message.id);
+    if (!pending || event.source !== pending.frame.contentWindow) return;
+    pending.cleanup();
+    showError(message.error || 'The download could not start. Please try again.');
+  });
 
   // Initialize Theme
   const savedTheme = localStorage.getItem('tubeswift_theme') || 'dark';
@@ -214,13 +224,11 @@ document.addEventListener('DOMContentLoaded', () => {
     resultCard.style.display = 'none';
     statusContainer.style.display = 'block';
     btnFetch.disabled = true;
-    statusText.textContent = 'Connecting to media server...';
+    statusText.textContent = 'Requesting available formats...';
 
-    // Progressive micro-status updates during cold fetch
+    // Elapsed time does not tell us which backend stage is executing.
     const statusTimers = [
-      setTimeout(() => { statusText.textContent = 'Solving media security challenge...'; }, 1000),
-      setTimeout(() => { statusText.textContent = 'Extracting 1080p, 720p & MP3 stream qualities...'; }, 2200),
-      setTimeout(() => { statusText.textContent = 'Finalizing download endpoints...'; }, 4200)
+      setTimeout(() => { statusText.textContent = 'Still preparing formats. This may take a little longer...'; }, 12000)
     ];
     const clearStatusTimers = () => statusTimers.forEach(clearTimeout);
 
@@ -506,6 +514,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Trigger Native Browser Download
   function triggerDownload(url, format, ext, title, btnElement, category = '', quality = '', height = '') {
+    hideError();
     const originalText = btnElement.innerHTML;
     btnElement.disabled = true;
     btnElement.innerHTML = `
@@ -526,11 +535,23 @@ document.addEventListener('DOMContentLoaded', () => {
     if (quality) downloadUrl += `&quality=${encodeURIComponent(quality)}`;
     if (height) downloadUrl += `&height=${encodeURIComponent(height)}`;
     
-    showToast(`Download started: ${title.substring(0, 30)}...`);
+    showToast(`Preparing download: ${(title || 'Video').substring(0, 30)}...`);
 
-    // Direct browser navigation: Since the server sends Content-Disposition: attachment,
-    // the page is never replaced, and the browser's native download manager starts immediately.
-    window.location.href = downloadUrl;
+    const id = crypto.randomUUID().replace(/-/g, '');
+    const frame = document.createElement('iframe');
+    frame.hidden = true;
+    frame.title = 'Download';
+    frame.src = `${downloadUrl}&${new URLSearchParams({ delivery: 'frame', deliveryId: id, deliveryOrigin: window.location.origin })}`;
+    const cleanup = () => {
+      clearTimeout(expiry);
+      pendingDownloads.delete(id);
+      frame.remove();
+      btnElement.disabled = false;
+      btnElement.innerHTML = originalText;
+    };
+    const expiry = setTimeout(cleanup, 65 * 60 * 1000);
+    pendingDownloads.set(id, { frame, cleanup });
+    document.body.appendChild(frame);
 
     setTimeout(() => {
       btnElement.disabled = false;

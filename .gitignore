@@ -6,3 +6,4 @@ node_modules/
 yt-dlp
 yt-dlp_macos
 cookies.txt
+.runtime/

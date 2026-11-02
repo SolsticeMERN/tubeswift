@@ -1,30 +1,46 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { spawn, execSync } = require('child_process');
+require('dotenv').config({ quiet: true });
+const { spawn: spawnProcess } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const { buildVideoInfo } = require('./lib/video-info');
 const { UpstreamGuard } = require('./lib/upstream-guard');
 const { VideoInfoCache } = require('./lib/video-cache');
+const { runtimePaths, buildYtDlpArgs } = require('./lib/downloader-config');
+const { createRuntimeHealth } = require('./lib/runtime-health');
+const { redactDiagnostic } = require('./lib/youtube-errors');
+const { browserDownloadErrors } = require('./lib/browser-download-errors');
 const FFMPEG_PATH = require('ffmpeg-static') || 'ffmpeg';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const upstreamGuard = new UpstreamGuard();
 const videoInfoCache = new VideoInfoCache({ ttlMs: 60 * 60 * 1000, maxItems: 300 });
-// Public downloads can run in guest mode or use configured session cookies.
-// Uses configured cookies (e.g. YOUTUBE_COOKIES_BASE64 on Render) if present,
-// unless YOUTUBE_AUTH_MODE=guest is explicitly set.
-const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE !== 'guest';
+// Public downloads do not depend on the owner's expiring account session.
+// Account cookies are explicitly opt-in for an administrator's own use.
+const USE_COOKIES = process.env.YOUTUBE_AUTH_MODE === 'cookies';
+const getRuntimeHealth = createRuntimeHealth({ ffmpegPath: FFMPEG_PATH });
+const activeChildren = new Set();
+function spawn(command, args, options) {
+  const child = spawnProcess(command, args, options);
+  activeChildren.add(child);
+  child.once('close', () => activeChildren.delete(child));
+  return child;
+}
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use('/api/download', browserDownloadErrors);
 
-// Health check endpoint for uptime monitors and warmup pings
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
+// Readiness verifies the local download components. The separate upstream
+// snapshot reports observed YouTube outcomes, not a promise of availability.
+app.get('/health', async (req, res) => {
+  const runtime = await getRuntimeHealth();
+  res.status(runtime.ready ? 200 : 503).json({ status: runtime.ready ? 'ok' : 'degraded',
+    uptime: process.uptime(), time: new Date().toISOString(), runtime, upstream: upstreamGuard.snapshot() });
 });
 
 
@@ -94,73 +110,17 @@ if (Number(process.versions.node.split('.')[0]) < 22) {
   console.warn('[WARN] YouTube JavaScript challenge solving requires Node.js 22 or newer.');
 }
 
-// Locate yt-dlp executable
-function getYtDlpPath() {
-  const possiblePaths = [
-    ...(process.platform === 'darwin' ? [path.join(__dirname, 'yt-dlp_macos')] : []),
-    path.join(__dirname, 'yt-dlp'),
-    ...(process.platform === 'darwin' ? ['/tmp/yt-dlp_macos'] : []),
-    '/Users/shakilsarker/Library/Python/3.9/bin/yt-dlp',
-    'yt-dlp',
-    '/usr/local/bin/yt-dlp',
-    '/usr/bin/yt-dlp'
-  ];
-  for (const p of possiblePaths) {
-    try {
-      if (p.startsWith('/') || p.includes('/')) {
-        if (fs.existsSync(p)) return p;
-      } else {
-        execSync(`which ${p}`, { stdio: 'ignore' });
-        return p;
-      }
-    } catch (e) {}
-  }
-  return 'yt-dlp';
-}
+// Use the verified runtime installed during the build, never a machine-specific
+// Python executable or an unrelated yt-dlp found on PATH.
+const YTDLP_PATH = runtimePaths().downloader;
+console.log(`[INFO] Using pinned yt-dlp at: ${YTDLP_PATH}`);
 
-const YTDLP_PATH = getYtDlpPath();
-console.log(`[INFO] Using yt-dlp at: ${YTDLP_PATH}`);
-
-// Let yt-dlp select compatible YouTube clients for the current release.
 function getBaseYtDlpArgs() {
-  const args = [
-    '--ignore-config',
-    '--socket-timeout', '20',
-    '--retries', '0',
-    '--extractor-retries', '0',
-    '--js-runtimes', `node:${process.execPath}`,
-    '--remote-components', 'ejs:github',
-    '--no-playlist'
-  ];
-  if (COOKIES_PATH && fs.existsSync(COOKIES_PATH)) {
-    args.push('--cookies', COOKIES_PATH);
-  }
-  if (process.env.YTDLP_PROXY) {
-    args.push('--proxy', process.env.YTDLP_PROXY);
-  }
-  return args;
+  return buildYtDlpArgs({ cookiePath: COOKIES_PATH && fs.existsSync(COOKIES_PATH) ? COOKIES_PATH : undefined });
 }
 
 function describeYtDlpError(stderr) {
-  // Let the guard evaluate whether this is a genuine network-level block.
-  // The guard itself now skips cooldown when stderr also contains "unavailable".
-  upstreamGuard.recordFailure(stderr);
-  // Check video-specific errors first — an unavailable/private/deleted video
-  // may also trigger a 429 when yt-dlp retries multiple player clients.
-  // The user should see "video unavailable", not "server rate limited".
-  if (/private video|video unavailable|video is unavailable|has been removed|not available in your country/i.test(stderr)) {
-    return { status: 404, code: 'VIDEO_UNAVAILABLE', message: 'This video is unavailable, private, or restricted.' };
-  }
-  if (/HTTP Error 429/i.test(stderr)) {
-    return { status: 503, code: 'YOUTUBE_RATE_LIMITED', retryAfter: 120, message: 'YouTube is temporarily limiting downloads from this server. Please try again in 2 minutes.' };
-  }
-  if (/cookies are no longer valid|cookies.*(?:expired|invalid)/i.test(stderr)) {
-    return { status: 503, code: 'YOUTUBE_COOKIES_EXPIRED', message: 'The server YouTube login has expired. The site administrator needs to refresh the saved session.' };
-  }
-  if (/sign in to confirm|not a bot/i.test(stderr)) {
-    return { status: 503, code: 'YOUTUBE_SESSION_REJECTED', retryAfter: 120, message: 'YouTube is currently rejecting requests from this server. Please try again later.' };
-  }
-  return { status: 502, code: 'YOUTUBE_REQUEST_FAILED', message: 'YouTube could not provide this video. Please try again later.' };
+  return upstreamGuard.recordFailure(stderr);
 }
 
 // Clean filename for HTTP Content-Disposition (Pure safe characters for all OS)
@@ -196,6 +156,12 @@ app.use(['/api/info', '/api/download'], async (req, res, next) => {
     }
   }
 
+  const runtime = await getRuntimeHealth();
+  if (!runtime.ready) {
+    res.set('Retry-After', '10');
+    return res.status(503).json({ success: false, code: 'DOWNLOAD_SERVICE_NOT_READY',
+      error: 'The download service is starting. Please try again shortly.' });
+  }
   const controller = new AbortController();
   const abort = () => controller.abort();
   res.once('close', abort);
@@ -250,7 +216,7 @@ app.get('/api/info', (req, res) => {
   const timer = setTimeout(() => {
     stop();
     if (!res.headersSent && !res.destroyed) res.status(504).json({ success: false, error: 'YouTube took too long to respond. Please try again later.' });
-  }, 60000);
+  }, 120000);
   res.on('close', () => {
     clearTimeout(timer);
     if (!res.writableEnded) stop();
@@ -271,7 +237,7 @@ app.get('/api/info', (req, res) => {
     clearTimeout(timer);
     if (res.headersSent || res.destroyed) return;
     if (code !== 0 || !stdout.trim()) {
-      console.warn(`[WARN] YouTube extraction failed for ${videoId}: ${stderr}`);
+      console.warn(`[WARN] YouTube extraction failed for ${videoId}: ${redactDiagnostic(stderr)}`);
       const failure = describeYtDlpError(stderr);
       if (failure.retryAfter) res.set('Retry-After', String(failure.retryAfter));
       return res.status(failure.status).json({ success: false, code: failure.code, error: failure.message });
@@ -281,6 +247,7 @@ app.get('/api/info', (req, res) => {
       if (!data.totalOptionsCount) {
         return res.status(502).json({ success: false, error: 'YouTube did not provide any downloadable formats for this video.' });
       }
+      upstreamGuard.recordSuccess();
       videoInfoCache.set(videoId, data);
       return res.json({ success: true, data });
     } catch (err) {
@@ -398,10 +365,10 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     const forceKill = setTimeout(() => signal('SIGKILL'), 2000);
     forceKill.unref();
   };
-  const fail = (status, message) => {
+  const fail = (status, message, code) => {
     if (responseStarted || res.destroyed || res.writableEnded) return;
     responseStarted = true;
-    res.status(status).json({ success: false, error: message });
+    res.status(status).json({ success: false, error: message, ...(code ? { code } : {}) });
   };
   res.once('close', () => {
     if (!res.writableFinished) {
@@ -432,11 +399,12 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
     stopTimers();
     if (cancelled || responseStarted || res.destroyed) return cleanup();
     if (code !== 0) {
-      console.warn(`[WARN] Download failed with code ${code}: ${stderr}`);
+      console.warn(`[WARN] Download failed with code ${code}: ${redactDiagnostic(stderr)}`);
       const failure = describeYtDlpError(stderr);
       if (failure.retryAfter) res.set('Retry-After', String(failure.retryAfter));
       cleanup();
-      return fail(failure.status, failure.message);
+      if (['VIDEO_FORMATS_CHANGED', 'VIDEO_UNAVAILABLE'].includes(failure.code)) videoInfoCache.delete(videoId);
+      return fail(failure.status, failure.message, failure.code);
     }
     const finalPath = path.resolve(stdout.trim().split(/\r?\n/).pop() || '');
     try {
@@ -450,6 +418,7 @@ app.get(['/api/download', '/api/download/:filename'], (req, res) => {
       cleanup();
       return fail(502, 'The requested format could not be prepared. Please refresh the video and choose an available format.');
     }
+    upstreamGuard.recordSuccess();
     responseStarted = true;
     const contentType = fileExt === 'mp3' ? 'audio/mpeg' : fileExt === 'm4a' ? 'audio/mp4'
       : fileExt === 'webm' ? (category === 'audio_only' ? 'audio/webm' : 'video/webm') : 'video/mp4';
@@ -524,8 +493,31 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`\n======================================================`);
   console.log(`🚀 TubeSwift Downloader Server Running at: http://localhost:${PORT}`);
   console.log(`======================================================\n`);
 });
+
+// Stop detached yt-dlp/FFmpeg groups as well as the HTTP listener on redeploy.
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const forceExit = setTimeout(() => process.exit(1), 4500);
+  const stopped = [...activeChildren].map(child => new Promise(resolve => {
+    const signal = name => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, name);
+        else child.kill(name);
+      } catch (_) {}
+    };
+    const forceKill = setTimeout(() => signal('SIGKILL'), 2000);
+    child.once('close', () => { clearTimeout(forceKill); resolve(); });
+    signal('SIGTERM');
+  }));
+  const closed = new Promise(resolve => httpServer.close(resolve));
+  Promise.all([...stopped, closed]).then(() => { clearTimeout(forceExit); process.exit(0); });
+}
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);

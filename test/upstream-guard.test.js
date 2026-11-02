@@ -38,18 +38,14 @@ test('unavailable videos do not take the service offline', async () => {
   release();
 });
 
-test('a 429 alongside "video unavailable" does not trigger cooldown', async () => {
+test('explicit 429 evidence is preserved alongside generic video unavailable text', async () => {
   const guard = new UpstreamGuard();
-  // yt-dlp retries multiple player clients on a dead video, producing both
-  // "unavailable" and "HTTP Error 429" in the same stderr output.
-  guard.recordFailure(
+  const failure = guard.recordFailure(
     'ERROR: [youtube] iCRSU4hgGlk: This video is unavailable\n' +
     'HTTP Error 429: Too Many Requests'
   );
-  // Server should still accept new requests — no cooldown triggered.
-  const release = await guard.acquire();
-  release();
-  assert.equal(guard.blockedUntil, 0);
+  assert.equal(failure.code, 'YOUTUBE_RATE_LIMITED');
+  await assert.rejects(guard.acquire(), { code: 'UPSTREAM_COOLDOWN' });
 });
 
 test('queue overflow and queue timeout are bounded', async () => {
