@@ -48,4 +48,7 @@ test('proxy userinfo cannot appear in recorded diagnostics', () => {
   const safe = redactDiagnostic(text);
   assert.doesNotMatch(safe, /alice|secret|p%40ss|user:/);
   assert.match(safe, /proxy.example:8000/);
+  const token = redactDiagnostic('A diagnostic containing poToken: private-value\nCookie: SID=secret; HSID=other\nSafe status');
+  assert.doesNotMatch(token, /private-value|SID=|HSID=/);
+  assert.match(token, /Safe status/);
 });

@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { lock, runtimePaths, tokenProviderUrl, buildYtDlpArgs, supportedNode } = require('../lib/downloader-config');
 const { supervise } = require('../lib/runtime-supervisor');
+const { relayProviderOutput } = require('../lib/provider-logs');
 
 async function main() {
   if (!supportedNode()) throw new Error('Use the Node.js version pinned in .node-version.');
@@ -23,7 +24,8 @@ async function main() {
   process.once('SIGTERM', () => controller.abort());
   process.once('SIGINT', () => controller.abort());
   const runtime = await supervise({
-    provider: { command: process.execPath, args: [paths.provider, '--host', '127.0.0.1', '--port', new URL(url).port], cwd: path.dirname(paths.provider), env },
+    provider: { command: process.execPath, args: [paths.provider, '--host', '127.0.0.1', '--port', new URL(url).port],
+      cwd: path.dirname(paths.provider), env, pipeOutput: relayProviderOutput },
     application: { command: process.execPath, args: [path.join(__dirname, '..', 'server.js')], env },
     healthUrl: `${url}/ping`, providerVersion: lock.poTokenProvider.version, signal: controller.signal
   });

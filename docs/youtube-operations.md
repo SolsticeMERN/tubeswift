@@ -18,6 +18,8 @@ The default client is `mweb`, using the installed HTTP PO-token plugin. Administ
 
 Optional `YTDLP_PROXY` accepts a supported HTTP(S)/SOCKS proxy URL. The same arguments are used for metadata and downloads; the plugin forwards yt-dlp's request proxy and token context to the local provider. Do not log credentials or generated tokens. Do not enable verbose token tracing on the public service. If evaluating a proxy later, qualify a consistent session route for token generation, extraction and media transfer rather than assuming rotation makes every request work. Proxy purchase/configuration is not part of this change.
 
+The provider's upstream defaults print token values. Its output is therefore piped through an allowlist: only the public startup line, a value-free token-generation notice and generic error notices reach application logs. Downloader error diagnostics also suppress credential/token lines and proxy userinfo. Do not switch the provider back to inherited stdout/stderr.
+
 ## Capacity, recovery and errors
 
 The backend accepts one upstream extraction/download at a time, with four waiting requests and a 30-second queue deadline. Metadata is cached for one hour. Stale-format and unavailable-video download failures invalidate that video's cached metadata. This is a small-instance capacity guard, not a durable worker queue.
